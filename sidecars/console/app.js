@@ -878,6 +878,51 @@
     });
   }
 
+  function buildSingleToolDetailHtml(tc, defaultStepIdx) {
+    const stepIdx = tc.stepIndex || defaultStepIdx || 0;
+    const isRun = tc.status === "RUNNING";
+    const isErr = tc.status === "ERROR";
+    const dotClass = isRun ? "running" : isErr ? "error" : "";
+    const targetText = tc.target || tc.action || tc.summary || "";
+    const durText =
+      tc.durationMs != null ? `${(tc.durationMs / 1000).toFixed(1)}s` : isRun ? "running…" : "";
+    const outText =
+      tc.outputPreview && tc.outputPreview.trim()
+        ? tc.outputPreview
+        : isRun
+        ? "Running — waiting for tool output..."
+        : "Completed (no text stdout)";
+    const detailId = `tc-${tc.id || stepIdx}-${tc.name}`;
+
+    return `
+      <details class="aux-pill" data-detail-id="${escapeHtml(detailId)}">
+        <summary title="Click to view tool output & arguments">
+          <div class="aux-pill-summary-left">
+            <span class="status-dot-sm ${dotClass}"></span>
+            <span class="aux-type-tag">${escapeHtml(tc.name)}</span>
+            <span class="tool-target-text">${escapeHtml(targetText)}</span>
+          </div>
+          <div class="aux-pill-summary-right">
+            ${durText ? `<span class="tool-dur">${escapeHtml(durText)}</span>` : ""}
+            <button type="button" class="btn-trace-step js-focus-step" data-step-index="${stepIdx}" data-tool-name="${escapeHtml(
+      tc.name
+    )}" title="Highlight step #${stepIdx} in Agent Tracer">Trace ↗</button>
+          </div>
+        </summary>
+        <div class="aux-pill-body">
+          <div class="tool-io-block">
+            <span class="tool-io-label">Tool Output (${escapeHtml(tc.status || "DONE")})</span>
+            <div class="tool-io-pre">${escapeHtml(outText)}</div>
+          </div>
+          <div class="tool-io-block">
+            <span class="tool-io-label">Input Arguments</span>
+            <div class="tool-io-pre">${escapeHtml(tc.argsPreview || "{}")}</div>
+          </div>
+        </div>
+      </details>
+    `;
+  }
+
   function buildMessageHtml(item, compact = false) {
     if (item.role === "user") {
       return `
@@ -887,52 +932,112 @@
       `;
     }
 
-    const timeLabel = fmtTimeShort(item.createdAt);
+    const timeLabel = fmtTimeShort(item.updatedAt || item.createdAt);
     const stepIdx = item.stepIndex || 0;
+    const tcalls = item.toolCalls || [];
+    const hasContent = Boolean(item.content && item.content.trim());
     let auxHtml = "";
 
-    if (!compact && item.thinking) {
+    // 1. Reasoning trace (shown in Full Chat, or in Overview when turn is in-progress)
+    if (item.thinking && (!compact || !hasContent)) {
       auxHtml += `
-        <details class="aux-pill">
-          <summary><span class="aux-type-tag">thought</span> Reasoning trace</summary>
+        <details class="aux-pill" data-detail-id="thought-${stepIdx}">
+          <summary>
+            <div class="aux-pill-summary-left">
+              <span class="aux-type-tag">thought</span>
+              <span class="tool-target-text">${escapeHtml(
+                item.thinkingSummary || "Reasoning trace"
+              )}</span>
+            </div>
+          </summary>
           <div class="aux-pill-body">${escapeHtml(item.thinking)}</div>
         </details>
       `;
     }
 
-    if (item.toolCalls && item.toolCalls.length > 0) {
-      item.toolCalls.forEach((tc) => {
-        const label = tc.summary ? `${tc.name} · ${tc.summary}` : tc.name;
-        if (compact) {
+    // 2. Tool calls + outputs (grouped cleanly so 50 tools never bury the message text)
+    if (tcalls.length > 0) {
+      const lastTc = tcalls[tcalls.length - 1];
+      const lastSummary = `${lastTc.name}${
+        lastTc.target ? ` · ${lastTc.target}` : lastTc.action ? ` · ${lastTc.action}` : ""
+      }`;
+      const errCount = tcalls.filter((t) => t.status === "ERROR").length;
+      const runCount = tcalls.filter((t) => t.status === "RUNNING").length;
+      const dotClass = runCount > 0 ? "running" : errCount > 0 ? "error" : "";
+
+      if (hasContent || tcalls.length > 3) {
+        if (!hasContent && tcalls.length > 3) {
+          // Turn is actively running: collapse earlier tools and show latest 3 live below
+          const earlier = tcalls.slice(0, -3);
+          const recent = tcalls.slice(-3);
           auxHtml += `
-            <button type="button" class="tool-chip-sync js-focus-step" data-step-index="${stepIdx}" data-tool-name="${escapeHtml(
-            tc.name
-          )}" title="${escapeHtml(
-            tc.argsPreview || ""
-          )}\nClick to highlight step #${stepIdx} in Agent Tracer">
-              <span>${escapeHtml(tc.name)}</span>
-            </button>
+            <details class="tools-group-drawer" data-detail-id="tg-early-${stepIdx}">
+              <summary>
+                <div class="tools-group-summary-left">
+                  <span class="aux-type-tag">+${earlier.length} earlier tools</span>
+                  <span class="tools-group-summary-latest">Click to inspect earlier tool outputs</span>
+                </div>
+                <span class="kpi-sub">Show ▾</span>
+              </summary>
+              <div class="tools-group-body">
+                ${earlier.map((tc) => buildSingleToolDetailHtml(tc, stepIdx)).join("")}
+              </div>
+            </details>
+            ${recent.map((tc) => buildSingleToolDetailHtml(tc, stepIdx)).join("")}
           `;
         } else {
+          // Turn has content (or completed): group all tool calls into one clean expandable drawer
           auxHtml += `
-            <details class="aux-pill">
-              <summary>
-                <span class="aux-type-tag">tool</span>
-                <span>${escapeHtml(label)}</span>
-                <button type="button" class="btn-trace-step js-focus-step" data-step-index="${stepIdx}" data-tool-name="${escapeHtml(
-            tc.name
-          )}" title="Highlight this step in Agent Tracer">Trace ↗</button>
+            <details class="tools-group-drawer" data-detail-id="tg-all-${stepIdx}">
+              <summary title="Click to expand all ${tcalls.length} tool calls and their outputs">
+                <div class="tools-group-summary-left">
+                  <span class="status-dot-sm ${dotClass}"></span>
+                  <span class="aux-type-tag">${tcalls.length} tool${
+            tcalls.length > 1 ? "s" : ""
+          } executed</span>
+                  <span class="tools-group-summary-latest">Last: ${escapeHtml(lastSummary)}</span>
+                </div>
+                <span class="kpi-sub">Outputs ▾</span>
               </summary>
-              <div class="aux-pill-body">${escapeHtml(tc.argsPreview || "{}")}</div>
+              <div class="tools-group-body">
+                ${tcalls.map((tc) => buildSingleToolDetailHtml(tc, stepIdx)).join("")}
+              </div>
             </details>
           `;
         }
-      });
+      } else {
+        // <= 3 tools while turn is in-progress: show them directly
+        auxHtml += tcalls.map((tc) => buildSingleToolDetailHtml(tc, stepIdx)).join("");
+      }
     }
 
-    const bodyHtml = item.content
-      ? `<div class="msg-body-text">${renderMarkdownLite(item.content)}</div>`
-      : "";
+    // 3. Primary body: either the assistant's markdown response OR a Live Progress banner while tools run
+    let bodyHtml = "";
+    if (hasContent) {
+      bodyHtml = `<div class="msg-body-text">${renderMarkdownLite(item.content)}</div>`;
+    } else {
+      const liveAction =
+        item.latestAction ||
+        (tcalls.length
+          ? `${tcalls[tcalls.length - 1].name} · ${
+              tcalls[tcalls.length - 1].target || tcalls[tcalls.length - 1].action || ""
+            }`
+          : "Processing request...");
+      const liveThought = item.thinkingSummary || "";
+      bodyHtml = `
+        <div class="msg-live-progress">
+          <div class="msg-live-progress-head">
+            <span class="status-dot-sm running"></span>
+            <span>Agent working: ${escapeHtml(liveAction)}</span>
+          </div>
+          ${
+            liveThought && liveThought !== liveAction
+              ? `<div class="msg-live-progress-thought">${escapeHtml(liveThought)}</div>`
+              : ""
+          }
+        </div>
+      `;
+    }
 
     return `
       <div class="msg-agent">
@@ -944,6 +1049,31 @@
         ${auxHtml ? `<div class="msg-aux-list">${auxHtml}</div>` : ""}
       </div>
     `;
+  }
+
+  function updateChatContainerPreservingDetails(container, html, shouldScrollBottom) {
+    if (!container) return;
+    const openIds = new Set();
+    container.querySelectorAll("details[data-detail-id]").forEach((d) => {
+      if (d.open) {
+        openIds.add(d.getAttribute("data-detail-id"));
+      }
+    });
+
+    container.innerHTML = html;
+
+    if (openIds.size > 0) {
+      container.querySelectorAll("details[data-detail-id]").forEach((d) => {
+        if (openIds.has(d.getAttribute("data-detail-id"))) {
+          d.open = true;
+        }
+      });
+    }
+
+    wireToolStepClickHandlers(container);
+    if (shouldScrollBottom) {
+      container.scrollTop = container.scrollHeight;
+    }
   }
 
   function wireToolStepClickHandlers(container) {
@@ -1026,13 +1156,30 @@
       const subCount = chat.subagentCount || 0;
       bentoTracerSub.textContent =
         subCount > 0
-          ? `${subCount} subagent${subCount > 1 ? "s" : ""} spawned · Click tool chips in Chat to trace`
-          : "Live DAG & Architecture · Click any tool in Chat to trace";
+          ? `${subCount} subagent${subCount > 1 ? "s" : ""} spawned · Click Trace ↗ on any tool to focus`
+          : "Live DAG & Architecture · Click Trace ↗ on any tool to focus";
     }
 
-    // Render message lists only if changed
-    const lastStepIdx = items.length ? items[items.length - 1].stepIndex : -1;
-    const hash = `${state.activeConvId}:${items.length}:${lastStepIdx}:${chat.status}`;
+    // Build a fine-grained signature of recent messages, content length, tool counts, and tool outputs
+    // so the UI ALWAYS re-renders when new tool calls, tool outputs, or final responses arrive!
+    const tailSig = items
+      .slice(-3)
+      .map((it) => {
+        const tcs = it.toolCalls || [];
+        const lastTc = tcs.length ? tcs[tcs.length - 1] : {};
+        return [
+          it.stepIndex,
+          it.lastStepIndex || it.stepIndex,
+          it.status || "",
+          (it.content || "").length,
+          (it.thinking || "").length,
+          tcs.length,
+          lastTc.status || "",
+          (lastTc.outputPreview || "").length,
+        ].join(":");
+      })
+      .join("|");
+    const hash = `${state.activeConvId}:${items.length}:${chat.totalSteps || 0}:${chat.status}:${tailSig}`;
     if (!forceScrollBottom && hash === state.lastChatHash) {
       return;
     }
@@ -1046,11 +1193,8 @@
       if (items.length === 0) {
         container.innerHTML = `<div class="empty-state">No messages found for this conversation yet. Send a prompt below to begin!</div>`;
       } else {
-        container.innerHTML = items.map((it) => buildMessageHtml(it, false)).join("");
-        wireToolStepClickHandlers(container);
-        if (forceScrollBottom || wasNearBottom) {
-          container.scrollTop = container.scrollHeight;
-        }
+        const html = items.map((it) => buildMessageHtml(it, false)).join("");
+        updateChatContainerPreservingDetails(container, html, forceScrollBottom || wasNearBottom);
       }
     }
 
@@ -1066,13 +1210,12 @@
         bentoContainer.innerHTML = `<div class="empty-state-sm">No messages in this session yet. Type below to prompt Jetski!</div>`;
       } else {
         const recentItems = items.slice(-10);
-        bentoContainer.innerHTML = recentItems
-          .map((it) => buildMessageHtml(it, true))
-          .join("");
-        wireToolStepClickHandlers(bentoContainer);
-        if (forceScrollBottom || wasNearBottom) {
-          bentoContainer.scrollTop = bentoContainer.scrollHeight;
-        }
+        const html = recentItems.map((it) => buildMessageHtml(it, true)).join("");
+        updateChatContainerPreservingDetails(
+          bentoContainer,
+          html,
+          forceScrollBottom || wasNearBottom
+        );
       }
     }
   }

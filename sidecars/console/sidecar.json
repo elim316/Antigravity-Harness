@@ -1,6 +1,6 @@
 {
   "display_name": "Jetski Harness",
-  "description": "Custom Jetski Harness v2.6 — Resizable & Drag-and-Drop Bento Grid, Compact Architecture DAG, Automation Explainers & Subagent Telemetry",
+  "description": "Custom Jetski Harness v2.7 — Live Chat Stream Updates, Expandable Tool Outputs, Collapsible Tool Drawers & Resizable Bento Grid",
   "command": "python3",
   "args": ["server.py"],
   "restart_policy": "always",

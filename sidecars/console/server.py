@@ -254,6 +254,8 @@ def _summarize_transcript_fast(conv_id: str) -> dict:
   updated_at = ""
   last_step_type = ""
   last_step_status = ""
+  last_step_has_tools = False
+  last_step_has_content = False
   last_action = ""
   char_count = 0
 
@@ -286,31 +288,45 @@ def _summarize_transcript_fast(conv_id: str) -> dict:
             first_user_text = content.splitlines()[0][:90]
 
         tcalls = obj.get("tool_calls") or []
+        if stype == "PLANNER_RESPONSE":
+          last_step_has_tools = bool(isinstance(tcalls, list) and tcalls)
+          last_step_has_content = bool((obj.get("content") or "").strip())
+
         if isinstance(tcalls, list) and tcalls:
           tool_count += len(tcalls)
           for tc in tcalls:
             tname = tc.get("name", "")
             if tname == "invoke_subagent":
               subagent_count += 1
-            args = tc.get("arguments") or {}
-            summary = (
-                args.get("toolAction")
-                or args.get("toolSummary")
-                or tname
-            )
-            if summary:
-              last_action = f"{summary}"
+            args = tc.get("arguments") or tc.get("args") or {}
+            if isinstance(args, dict):
+              summary = (
+                  args.get("toolAction")
+                  or args.get("toolSummary")
+                  or tname
+              )
+              if isinstance(summary, str):
+                summary = summary.strip().strip('"').strip()
+              if summary:
+                last_action = f"{summary}"
   except OSError:
     pass
 
   if not updated_at and mtime:
     updated_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
-  # Determine status heuristic if LS doesn't override
+  # Determine status heuristic if LS doesn't override:
+  # If the last step is a DONE PLANNER_RESPONSE with final content and zero tool_calls, the turn is IDLE.
   age_sec = time.time() - mtime if mtime else 999999
-  if last_step_status in ("RUNNING", "IN_PROGRESS", "PENDING") or (
-      age_sec < 20 and last_step_type in ("USER_INPUT", "PLANNER_RESPONSE")
-  ):
+  turn_completed = (
+      last_step_type == "PLANNER_RESPONSE"
+      and last_step_status == "DONE"
+      and last_step_has_content
+      and not last_step_has_tools
+  )
+  if last_step_status in ("RUNNING", "IN_PROGRESS", "PENDING"):
+    status = "RUNNING"
+  elif not turn_completed and age_sec < 15 and last_step_type in ("USER_INPUT", "PLANNER_RESPONSE", "GENERIC"):
     status = "RUNNING"
   elif last_step_status == "ERROR":
     status = "ERROR"
@@ -324,6 +340,7 @@ def _summarize_transcript_fast(conv_id: str) -> dict:
       "subagentCount": subagent_count,
       "title": first_user_text,
       "status": status,
+      "turnCompleted": turn_completed,
       "lastStepType": last_step_type,
       "lastAction": last_action,
       "updatedAt": updated_at,
@@ -569,8 +586,8 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
     else:
       status = tmeta["status"]
 
-    if cid == active_conv_id and status == "IDLE":
-      # Check if modified within last 12 seconds
+    if cid == active_conv_id and status == "IDLE" and not tmeta.get("turnCompleted"):
+      # Check if modified within last 12 seconds while turn is still in progress
       if time.time() - tmeta.get("mtime", 0) < 12:
         status = "RUNNING"
 
@@ -1405,25 +1422,39 @@ def _parse_tool_result_step(res_step: dict, tool_name: str) -> dict:
   }
 
 
+def _clean_arg_value(val):
+  """Recursively strips double-encoded surrounding quotes from compact transcript tool args."""
+  if isinstance(val, str):
+    s = val.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+      s = s[1:-1].strip()
+    return s
+  if isinstance(val, dict):
+    return {k: _clean_arg_value(v) for k, v in val.items()}
+  if isinstance(val, list):
+    return [_clean_arg_value(x) for x in val]
+  return val
+
+
 def _extract_tool_target(name: str, args: dict) -> str:
   if not isinstance(args, dict):
     return ""
   for key in ("AbsolutePath", "TargetFile", "NotebookPath", "Url", "Query"):
-    val = args.get(key)
+    val = _clean_arg_value(args.get(key))
     if val and isinstance(val, str):
       if key in ("AbsolutePath", "TargetFile", "NotebookPath"):
         parts = val.rstrip("/").split("/")
         return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
       return val[:70]
   if name == "run_command" and args.get("CommandLine"):
-    cmd = str(args["CommandLine"]).strip().splitlines()[0]
+    cmd = _clean_arg_value(str(args["CommandLine"])).splitlines()[0]
     return cmd[:72] + ("…" if len(cmd) > 72 else "")
   if name == "call_mcp_tool":
-    return f"{args.get('ServerName', '')} · {args.get('ToolName', '')}".strip(" ·")
+    return f"{_clean_arg_value(args.get('ServerName', ''))} · {_clean_arg_value(args.get('ToolName', ''))}".strip(" ·")
   if name == "invoke_subagent":
     subs = args.get("Subagents") or []
     if subs and isinstance(subs, list) and isinstance(subs[0], dict):
-      return f"{subs[0].get('Role') or subs[0].get('TypeName') or 'Subagent'}"
+      return f"{_clean_arg_value(subs[0].get('Role') or subs[0].get('TypeName') or 'Subagent')}"
   return ""
 
 
@@ -1466,6 +1497,7 @@ def _build_chat_stream(conv_id: str) -> dict:
         items.append({
             "kind": "user",
             "stepIndex": sidx,
+            "lastStepIndex": sidx,
             "createdAt": created,
             "content": user_text,
             "systemNotice": sys_notice,
@@ -1474,6 +1506,11 @@ def _build_chat_stream(conv_id: str) -> dict:
       continue
 
     if stype == "PLANNER_RESPONSE":
+      trunc_fields = st.get("truncated_fields") or []
+      if "content" in trunc_fields:
+        full_st = _read_step_full(conv_id, sidx)
+        if full_st and full_st.get("content"):
+          st = {**st, "content": full_st["content"]}
       thinking = (st.get("thinking") or "").strip()
       content = (st.get("content") or "").strip()
       raw_tcalls = st.get("tool_calls") or []
@@ -1489,6 +1526,7 @@ def _build_chat_stream(conv_id: str) -> dict:
             targs = json.loads(targs)
           except Exception:
             targs = {"raw": targs}
+        targs = _clean_arg_value(targs) if isinstance(targs, dict) else {"raw": str(targs)}
         action_label = (
             (targs.get("toolAction") if isinstance(targs, dict) else None)
             or (targs.get("toolSummary") if isinstance(targs, dict) else None)
@@ -1530,9 +1568,20 @@ def _build_chat_stream(conv_id: str) -> dict:
             **res_meta,
         })
 
+      latest_tool_desc = ""
+      if paired_tools:
+        lt = paired_tools[-1]
+        latest_tool_desc = (
+            f"{lt['action']} ({lt['target']})"
+            if lt.get("target") and lt.get("action") and lt["target"] not in lt["action"]
+            else (lt.get("action") or lt.get("target") or lt["name"])
+        )
+
       gen_stat = gen_by_step.get(sidx)
       if items and items[-1].get("kind") == "assistant":
         prev = items[-1]
+        prev["lastStepIndex"] = sidx
+        prev["updatedAt"] = created
         prev["status"] = st.get("status") or prev["status"]
         if thinking:
           prev["thinking"] = (
@@ -1541,6 +1590,10 @@ def _build_chat_stream(conv_id: str) -> dict:
               else thinking
           )
           prev["thinkingSummary"] = _summarize_thinking_line(thinking)
+        if latest_tool_desc:
+          prev["latestAction"] = latest_tool_desc
+        elif thinking:
+          prev["latestAction"] = _summarize_thinking_line(thinking)
         if content:
           prev["content"] = (
               f"{prev['content']}\n\n{content}"
@@ -1561,11 +1614,14 @@ def _build_chat_stream(conv_id: str) -> dict:
         items.append({
             "kind": "assistant",
             "stepIndex": sidx,
+            "lastStepIndex": sidx,
             "createdAt": created,
+            "updatedAt": created,
             "status": st.get("status") or "DONE",
             "thinking": thinking,
             "thinkingSummary": _summarize_thinking_line(thinking),
-            "thinkingTruncated": "thinking" in (st.get("truncated_fields") or []),
+            "latestAction": latest_tool_desc or _summarize_thinking_line(thinking),
+            "thinkingTruncated": "thinking" in trunc_fields,
             "content": content,
             "toolCalls": paired_tools,
             "tokenTurn": gen_stat,
@@ -1584,6 +1640,7 @@ def _build_chat_stream(conv_id: str) -> dict:
       items.append({
           "kind": "error",
           "stepIndex": sidx,
+          "lastStepIndex": sidx,
           "createdAt": created,
           "content": err_content,
       })
@@ -1874,6 +1931,20 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
     if path == "/api/update-status":
       force = params.get("force", ["0"])[0] == "1"
       self._send_json(_check_tracer_git_update(force=force))
+      return
+
+    if path == "/api/conversations":
+      host_cid = (
+          params.get("conversationId", [None])[0]
+          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
+          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+          or ""
+      )
+      convs, _ = _list_conversations(host_cid)
+      self._send_json({
+          "conversations": convs,
+          "hostConversationId": host_cid,
+      })
       return
 
     # Structured Chat Stream API for the Primary Chat Canvas
