@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Jetski Harness</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="preload.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Navigation Bar (Two-row layout in Aux Pane so nothing is ever clipped) -->
+    <header class="topbar">
+      <div class="topbar-row-main">
+        <div class="topbar-left">
+          <div class="brand">
+            <span class="brand-dot" id="ls-status-dot" title="Connecting to Jetski Language Server..."></span>
+            <span class="brand-title">Jetski Harness</span>
+          </div>
+
+          <!-- Primary Session Selector + Prev/Next + New -->
+          <div class="session-picker-wrap">
+            <button id="btn-prev-session" class="btn-nav-arrow" title="Previous conversation">&#9664;</button>
+            <select id="session-select" class="session-select js-session-select" title="Switch active conversation"></select>
+            <button id="btn-next-session" class="btn-nav-arrow" title="Next conversation">&#9654;</button>
+            <button id="btn-new-session" class="btn-ghost btn-sm" title="Start a new agent conversation">+ New</button>
+          </div>
+        </div>
+
+        <!-- Right Actions: Reset Grid Layout + Theme Toggle + Prominent Full Screen Button + Refresh -->
+        <div class="topbar-right">
+          <button id="btn-reset-layout" class="btn-icon-text" title="Reset Overview grid splitters, card order, and wide cards to default">
+            <span>↺</span>
+            <span>Reset Layout</span>
+          </button>
+          <button id="btn-theme-toggle" class="btn-icon-text" title="Toggle Light / Dark theme (synced with Agent Tracer)">
+            <span id="theme-icon">🌙</span>
+            <span id="theme-label">Dark</span>
+          </button>
+          <button id="btn-popout-tab" class="btn-fullscreen js-btn-fullscreen" title="Open Jetski Harness in a Full Browser Tab">
+            <span>⛶</span>
+            <span>Full Screen</span>
+          </button>
+          <button id="btn-refresh" class="btn-icon" title="Refresh state now">↻</button>
+        </div>
+      </div>
+
+      <!-- Segmented Navigation Bar (Overview + 4 Pillars with Crisp SVG Icons) -->
+      <nav class="main-tabs" role="tablist">
+        <button class="tab-btn active" data-tab="overview" role="tab">
+          <svg class="nav-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+            <rect x="2" y="2" width="5" height="5" rx="1" />
+            <rect x="9" y="2" width="5" height="5" rx="1" />
+            <rect x="2" y="9" width="5" height="5" rx="1" />
+            <rect x="9" y="9" width="5" height="5" rx="1" />
+          </svg>
+          <span>Overview</span>
+        </button>
+        <button class="tab-btn" data-tab="chat" role="tab">
+          <svg class="nav-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+            <path d="M2.5 3.5h11a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H6L2.5 14.5v-10a1 1 0 0 1 1-1Z" stroke-linejoin="round" />
+          </svg>
+          <span>Chat</span>
+          <span class="tab-pill" id="chat-count-pill">0</span>
+        </button>
+        <button class="tab-btn" data-tab="tracer" role="tab">
+          <svg class="nav-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+            <circle cx="3.5" cy="8" r="1.8" />
+            <circle cx="12.5" cy="4" r="1.8" />
+            <circle cx="12.5" cy="12" r="1.8" />
+            <path d="M5.2 7.3L10.8 4.7M5.2 8.7l5.6 2.6" stroke-linecap="round" />
+          </svg>
+          <span>Agent Tracer</span>
+          <span class="tab-pill" id="tracer-subagent-pill" hidden>0</span>
+        </button>
+        <button class="tab-btn" data-tab="automations" role="tab">
+          <svg class="nav-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+            <path d="M8.8 1.8L3.5 9h4.2l-.5 5.2L12.5 7H8.3l.5-5.2Z" stroke-linejoin="round" />
+          </svg>
+          <span>Automations</span>
+          <span class="tab-pill" id="auto-count-pill">0</span>
+        </button>
+        <button class="tab-btn" data-tab="tokens" role="tab">
+          <svg class="nav-svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+            <path d="M2.5 13.5v-5M6.2 13.5v-8M9.8 13.5v-6M13.5 13.5v-10" stroke-linecap="round" />
+          </svg>
+          <span>Tokens</span>
+          <span class="tab-pill" id="token-summary-pill">--</span>
+        </button>
+      </nav>
+    </header>
+
+    <!-- Main View Container -->
+    <main class="view-container">
+
+      <!-- TAB 0: OVERVIEW (Resizable & Drag-and-Drop 2x2 Bento Grid) -->
+      <section id="view-overview" class="tab-view active">
+        <div id="bento-grid" class="bento-grid">
+
+          <!-- Interactive Grid Resizer Bars (Drag to resize columns/rows, double-click to reset) -->
+          <div id="bento-col-resizer" class="bento-resizer bento-resizer-col" title="Drag left/right to resize columns · Double-click to reset"></div>
+          <div id="bento-row-resizer" class="bento-resizer bento-resizer-row" title="Drag up/down to resize rows · Double-click to reset"></div>
+
+          <!-- Quadrant 1: Live Agent Chat & Quick Composer -->
+          <div class="bento-card bento-chat" data-card-id="chat">
+            <div class="bento-header">
+              <div class="bento-title-group">
+                <span class="card-drag-handle" draggable="true" title="Drag to swap card position">⋮⋮</span>
+                <span class="bento-icon-svg">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+                    <path d="M2.5 3.5h11a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H6L2.5 14.5v-10a1 1 0 0 1 1-1Z" stroke-linejoin="round" />
+                  </svg>
+                </span>
+                <div class="bento-title-stack">
+                  <h3 class="bento-title" id="bento-chat-title">Agent Chat</h3>
+                  <span class="bento-sub" id="bento-chat-subtitle">Live conversation stream</span>
+                </div>
+              </div>
+              <div class="bento-actions">
+                <span class="status-pill" id="bento-chat-status">IDLE</span>
+                <button type="button" class="btn-card-util js-toggle-wide" data-card="chat" title="Toggle full-width (span 2 columns)">⇔</button>
+                <button type="button" class="btn-expand" data-goto-tab="chat" title="Open Full Chat View">Expand ↗</button>
+              </div>
+            </div>
+
+            <!-- Live Subagent Mini-Feed Strip (populated when subagents are spawned) -->
+            <div id="bento-subagent-strip" class="subagent-strip" hidden></div>
+
+            <div class="bento-chat-messages" id="bento-chat-messages">
+              <div class="empty-state-sm">Loading conversation...</div>
+            </div>
+
+            <div class="bento-composer">
+              <input
+                type="text"
+                id="bento-prompt-input"
+                class="bento-input"
+                placeholder="Reply to selected chat or start a task... (Enter to send)"
+              />
+              <button id="bento-btn-send" class="btn-primary btn-sm">Send ↵</button>
+            </div>
+          </div>
+
+          <!-- Quadrant 2: Live Agent Tracer DAG (Timeline + Architecture Switcher in Compact Mode) -->
+          <div class="bento-card bento-tracer" id="bento-card-tracer" data-card-id="tracer">
+            <div class="bento-header">
+              <div class="bento-title-group">
+                <span class="card-drag-handle" draggable="true" title="Drag to swap card position">⋮⋮</span>
+                <span class="bento-icon-svg">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+                    <circle cx="3.5" cy="8" r="1.8" />
+                    <circle cx="12.5" cy="4" r="1.8" />
+                    <circle cx="12.5" cy="12" r="1.8" />
+                    <path d="M5.2 7.3L10.8 4.7M5.2 8.7l5.6 2.6" stroke-linecap="round" />
+                  </svg>
+                </span>
+                <div class="bento-title-stack">
+                  <h3 class="bento-title">Agent Tracer</h3>
+                  <span class="bento-sub" id="bento-tracer-sub">Live parent/subagent execution DAG</span>
+                </div>
+              </div>
+              <div class="bento-actions">
+                <div class="mini-seg-group" role="group" aria-label="Tracer Mode">
+                  <button type="button" class="mini-seg-btn active js-tracer-mode" data-mode="timeline" title="Timeline & Step Waterfall">Timeline</button>
+                  <button type="button" class="mini-seg-btn js-tracer-mode" data-mode="topology" title="Agent & Tool Architecture Diagram">Architecture</button>
+                </div>
+                <button type="button" class="btn-card-util js-toggle-wide" data-card="tracer" title="Toggle full-width (span 2 columns)">⇔</button>
+                <button type="button" class="btn-expand" data-goto-tab="tracer" title="Open Full Agent Tracer with Search & Inspector">Expand ↗</button>
+              </div>
+            </div>
+            <div class="bento-tracer-body">
+              <iframe
+                id="overview-tracer-iframe"
+                class="bento-tracer-iframe"
+                src="tracer?compact=1"
+                title="Agent Tracer Overview Preview"
+              ></iframe>
+            </div>
+          </div>
+
+          <!-- Quadrant 3: Tokens, Context Saturation & Cache Efficiency -->
+          <div class="bento-card bento-tokens" data-card-id="tokens">
+            <div class="bento-header">
+              <div class="bento-title-group">
+                <span class="card-drag-handle" draggable="true" title="Drag to swap card position">⋮⋮</span>
+                <span class="bento-icon-svg">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+                    <path d="M2.5 13.5v-5M6.2 13.5v-8M9.8 13.5v-6M13.5 13.5v-10" stroke-linecap="round" />
+                  </svg>
+                </span>
+                <div class="bento-title-stack">
+                  <h3 class="bento-title">Token Usage & Cache</h3>
+                  <span class="bento-sub" id="bento-model-label">Model: --</span>
+                </div>
+              </div>
+              <div class="bento-actions">
+                <button type="button" class="btn-card-util js-toggle-wide" data-card="tokens" title="Toggle full-width (span 2 columns)">⇔</button>
+                <button type="button" class="btn-expand" data-goto-tab="tokens" title="Open Full Token Breakdown">Details ↗</button>
+              </div>
+            </div>
+
+            <div class="bento-tokens-body">
+              <div class="mini-kpi-grid">
+                <button type="button" class="mini-kpi js-metric-card" data-metric="session_tokens" title="Click to explain Session Tokens">
+                  <div class="mini-kpi-top">
+                    <span class="mini-kpi-label">Session Tokens</span>
+                    <span class="metric-help-badge">?</span>
+                  </div>
+                  <span class="mini-kpi-value" id="bento-tok-session">--</span>
+                </button>
+                <button type="button" class="mini-kpi js-metric-card" data-metric="cache_hit_rate" title="Click to explain Cache Hit Rate">
+                  <div class="mini-kpi-top">
+                    <span class="mini-kpi-label">Cache Hit Rate</span>
+                    <span class="metric-help-badge">?</span>
+                  </div>
+                  <span class="mini-kpi-value text-green" id="bento-tok-cache">--%</span>
+                </button>
+                <button type="button" class="mini-kpi js-metric-card" data-metric="session_cost" title="Click to explain Estimated Session Cost">
+                  <div class="mini-kpi-top">
+                    <span class="mini-kpi-label">Est. Session Cost</span>
+                    <span class="metric-help-badge">?</span>
+                  </div>
+                  <span class="mini-kpi-value" id="bento-tok-cost">$0.00</span>
+                </button>
+                <button type="button" class="mini-kpi js-metric-card" data-metric="global_tokens" title="Click to explain All Recent Sessions">
+                  <div class="mini-kpi-top">
+                    <span class="mini-kpi-label">Recent Sessions</span>
+                    <span class="metric-help-badge">?</span>
+                  </div>
+                  <span class="mini-kpi-value" id="bento-tok-global">--</span>
+                </button>
+              </div>
+
+              <!-- Context Window Saturation Gauge (Click to explain Compaction Threshold) -->
+              <div class="context-gauge-box js-metric-card" data-metric="context_saturation" title="Click to explain Context Window Saturation & Compaction Threshold">
+                <div class="context-gauge-top">
+                  <span class="context-gauge-label">Context Window Saturation <span class="metric-help-badge">?</span></span>
+                  <span class="context-gauge-val" id="bento-context-val">0k / 200k (0%)</span>
+                </div>
+                <div class="context-gauge-track">
+                  <div class="context-gauge-fill" id="bento-context-fill" style="width: 0%"></div>
+                </div>
+              </div>
+
+              <!-- Click-to-Explain Popover inside Bento Tokens Card -->
+              <div id="bento-metric-explainer" class="metric-explainer-box" hidden></div>
+
+              <div class="bento-spark-section">
+                <div class="bento-spark-header">
+                  <span class="js-metric-card metric-link-label" data-metric="turn_bars" title="Click to explain Per-Turn Context Bars">
+                    Recent LLM Turns <span class="metric-help-badge">?</span>
+                  </span>
+                  <span id="bento-turn-count">0 turns</span>
+                </div>
+                <div id="bento-turn-bars" class="bento-turn-bars"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Quadrant 4: Automations, Sidecars & MCP (with Click-to-Explain Drawer) -->
+          <div class="bento-card bento-automations" data-card-id="automations">
+            <div class="bento-header">
+              <div class="bento-title-group">
+                <span class="card-drag-handle" draggable="true" title="Drag to swap card position">⋮⋮</span>
+                <span class="bento-icon-svg">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
+                    <path d="M8.8 1.8L3.5 9h4.2l-.5 5.2L12.5 7H8.3l.5-5.2Z" stroke-linejoin="round" />
+                  </svg>
+                </span>
+                <div class="bento-title-stack">
+                  <h3 class="bento-title">Automations & Runtime</h3>
+                  <span class="bento-sub" id="bento-auto-sub">Click any job below to explain schedule & logic</span>
+                </div>
+              </div>
+              <div class="bento-actions">
+                <button type="button" class="btn-card-util js-toggle-wide" data-card="automations" title="Toggle full-width (span 2 columns)">⇔</button>
+                <button type="button" class="btn-expand" data-goto-tab="automations" title="Manage Automations & Daemons">Manage ↗</button>
+              </div>
+            </div>
+
+            <div class="bento-auto-body">
+              <div id="bento-auto-list" class="bento-auto-list"></div>
+              <!-- Click-to-Explain Popover for Automations inside Overview -->
+              <div id="bento-auto-explainer" class="metric-explainer-box" hidden></div>
+              <div class="bento-mcp-strip" id="bento-mcp-strip"></div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- TAB 1: FULL CHAT -->
+      <section id="view-chat" class="tab-view">
+        <div class="chat-container">
+          <!-- Session Context Banner with Direct Conversation Switcher & Full Screen Button -->
+          <div class="chat-session-bar">
+            <div class="chat-session-info">
+              <span class="status-badge" id="chat-status-badge">IDLE</span>
+              <select id="chat-session-select" class="session-select chat-header-select js-session-select" title="Switch conversation"></select>
+              <span class="chat-session-meta" id="chat-session-meta"></span>
+            </div>
+            <div class="chat-session-actions">
+              <button id="btn-stop-agent" class="btn-danger btn-sm" hidden>Stop Agent</button>
+              <button id="btn-open-native" class="btn-secondary btn-sm" title="Switch Jetski's left-hand chat pane to this conversation" hidden>Load in Left Pane</button>
+              <button class="btn-fullscreen btn-sm js-btn-fullscreen" title="Open Jetski Harness in a Full Browser Tab">⛶ Full Screen</button>
+            </div>
+          </div>
+
+          <!-- Live Subagent Mini-Feed Strip in Full Chat -->
+          <div id="chat-subagent-strip" class="subagent-strip subagent-strip-lg" hidden></div>
+
+          <!-- Scrollable Chat Stream -->
+          <div id="chat-messages" class="chat-messages">
+            <div class="empty-state">Loading conversation stream...</div>
+          </div>
+
+          <!-- Clean Prompt Composer -->
+          <div class="chat-composer-wrap">
+            <div id="composer-error" class="composer-error" hidden></div>
+            <div class="chat-composer">
+              <textarea
+                id="prompt-input"
+                class="prompt-textarea"
+                rows="2"
+                placeholder="Ask Jetski anything, or send a follow-up to the selected conversation... (Enter to send, Shift+Enter for newline)"
+              ></textarea>
+              <div class="composer-controls">
+                <div class="composer-left">
+                  <label class="composer-target-label">
+                    <input type="checkbox" id="chk-new-conversation" />
+                    <span>Start as new conversation</span>
+                  </label>
+                </div>
+                <div class="composer-right">
+                  <span class="composer-hint">⌘/Ctrl + Enter or Enter</span>
+                  <button id="btn-send-prompt" class="btn-primary">Send ↵</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: AGENT TRACER -->
+      <section id="view-tracer" class="tab-view">
+        <div class="tracer-full-wrap">
+          <iframe
+            id="tracer-iframe"
+            class="tracer-iframe"
+            src="tracer"
+            title="Agent Tracer Execution Graph"
+          ></iframe>
+        </div>
+      </section>
+
+      <!-- TAB 3: AUTOMATIONS & BACKGROUND JOBS -->
+      <section id="view-automations" class="tab-view">
+        <div class="page-scroll">
+          <div class="page-header">
+            <div>
+              <h2 class="page-title">Automations & Background Sidecars</h2>
+              <p class="page-subtitle">Click any automation or sidecar card (or its <strong>? Explain</strong> badge) to inspect its schedule, trigger command, and safety logic.</p>
+            </div>
+          </div>
+
+          <!-- Click-to-Explain Drawer inside Full Automations Tab -->
+          <div id="automations-explainer" class="metric-explainer-box metric-explainer-lg" hidden></div>
+
+          <div class="section-block">
+            <h3 class="section-heading">Scheduled Automations (Cron & Daemons)</h3>
+            <div id="automations-grid" class="cards-grid"></div>
+          </div>
+
+          <div class="section-block">
+            <h3 class="section-heading">Active Sidecar Services & UI Plugins</h3>
+            <div id="sidecars-grid" class="cards-grid"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: TOKENS & MCP -->
+      <section id="view-tokens" class="tab-view">
+        <div class="page-scroll">
+          <div class="page-header">
+            <div>
+              <h2 class="page-title">Token Usage, Cost & MCP Servers</h2>
+              <p class="page-subtitle" id="tokens-subtitle">Click any metric card or the Context Window Saturation gauge below to see how it is calculated and view its live breakdown.</p>
+            </div>
+          </div>
+
+          <!-- Top 4 Interactive Metric Cards -->
+          <div class="kpi-grid">
+            <button type="button" class="kpi-card js-metric-card" data-metric="session_tokens" title="Click to explain Active Session Tokens">
+              <div class="kpi-card-top">
+                <span class="kpi-label">Active Session Tokens</span>
+                <span class="metric-help-badge">?</span>
+              </div>
+              <div class="kpi-value" id="kpi-session-tokens">--</div>
+              <span class="kpi-sub" id="kpi-session-sub">Prompt + Output</span>
+            </button>
+            <button type="button" class="kpi-card js-metric-card" data-metric="cache_hit_rate" title="Click to explain Cache Hit Efficiency">
+              <div class="kpi-card-top">
+                <span class="kpi-label">Cache Hit Efficiency</span>
+                <span class="metric-help-badge">?</span>
+              </div>
+              <div class="kpi-value text-green" id="kpi-cache-pct">--%</div>
+              <span class="kpi-sub" id="kpi-cache-sub">Cached context reuse</span>
+            </button>
+            <button type="button" class="kpi-card js-metric-card" data-metric="session_cost" title="Click to explain Est. Session Cost">
+              <div class="kpi-card-top">
+                <span class="kpi-label">Est. Session Cost</span>
+                <span class="metric-help-badge">?</span>
+              </div>
+              <div class="kpi-value" id="kpi-cost">$0.00</div>
+              <span class="kpi-sub" id="kpi-model-name">Model: --</span>
+            </button>
+            <button type="button" class="kpi-card js-metric-card" data-metric="global_tokens" title="Click to explain Recent Sessions Total">
+              <div class="kpi-card-top">
+                <span class="kpi-label">Recent Sessions Total</span>
+                <span class="metric-help-badge">?</span>
+              </div>
+              <div class="kpi-value" id="kpi-global-tokens">--</div>
+              <span class="kpi-sub" id="kpi-global-sub">Across recent conversations</span>
+            </button>
+          </div>
+
+          <!-- Full-Width Context Window Saturation Gauge -->
+          <div class="panel-box context-gauge-panel js-metric-card" data-metric="context_saturation" title="Click to explain Context Window Saturation & Compaction Threshold">
+            <div class="context-gauge-top">
+              <span class="context-gauge-label">Active Context Window Saturation (Compaction Threshold ~200k) <span class="metric-help-badge">?</span></span>
+              <span class="context-gauge-val" id="tokens-context-val">0k / 200k (0%)</span>
+            </div>
+            <div class="context-gauge-track context-gauge-track-lg">
+              <div class="context-gauge-fill" id="tokens-context-fill" style="width: 0%"></div>
+            </div>
+          </div>
+
+          <!-- Click-to-Explain Popover inside Full Tokens Tab -->
+          <div id="tokens-metric-explainer" class="metric-explainer-box metric-explainer-lg" hidden></div>
+
+          <!-- Per-Turn Token Breakdown -->
+          <div class="section-block">
+            <div class="section-heading-row">
+              <h3 class="section-heading">Per-Turn Context Growth (Selected Conversation)</h3>
+              <div class="bar-legend js-metric-card" data-metric="turn_bars" title="Click to explain Cached vs Fresh vs Output bars">
+                <span class="legend-item"><span class="legend-dot cached"></span>Cached Prompt</span>
+                <span class="legend-item"><span class="legend-dot fresh"></span>Fresh Input</span>
+                <span class="legend-item"><span class="legend-dot out"></span>Model Output</span>
+                <span class="metric-help-badge">?</span>
+              </div>
+            </div>
+            <div class="panel-box">
+              <div id="turn-bars-container" class="turn-bars-list"></div>
+            </div>
+          </div>
+
+          <!-- Connected MCP Servers & Memory -->
+          <div class="two-col-grid">
+            <div class="section-block">
+              <h3 class="section-heading">Connected MCP Servers <span class="badge-subtle" id="mcp-count-badge">0</span></h3>
+              <div class="panel-box">
+                <div id="mcp-servers-list" class="simple-list"></div>
+              </div>
+            </div>
+            <div class="section-block">
+              <h3 class="section-heading">Recent Memory Files (`/memory/default`)</h3>
+              <div class="panel-box">
+                <div id="memories-list" class="simple-list"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

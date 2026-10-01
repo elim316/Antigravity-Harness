@@ -1,0 +1,4 @@
+{
+  "name": "jetski-harness",
+  "description": "Custom Jetski Mission Control & UI Harness featuring live agent & cron automation monitoring, real-time token and cost telemetry, Workspace MCP health, and an embedded Agent Tracer DAG."
+}
