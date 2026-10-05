@@ -8,7 +8,7 @@ Provides:
    with ~/.gemini/jetski/brain/<id>/.system_generated/logs/transcript.jsonl).
 3. Automations & Sidecars monitor (scans ~/.gemini/config/sidecars, plugins,
    and builtin sidecars; matches live OS PIDs & uptimes; translates UTC crons
-   to SGT UTC+8; reads Eli's Spotter state and sidecar logs).
+   to SGT UTC+8; reads local state trackers and sidecar logs).
 4. Jetski Runtime & Workspace MCP Status (all 9 Google Workspace MCP servers,
    tool counts, OAuth token expiry, Memory FUSE health, Language Server status).
 5. Full compatibility & dynamic conversation switching for the user's
