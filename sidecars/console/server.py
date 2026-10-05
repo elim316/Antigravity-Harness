@@ -409,8 +409,11 @@ def _get_token_telemetry(conv_id: str, include_generations: bool = True, allow_r
 
   cached = _lru_get(_TOKEN_USAGE_CACHE, conv_id)
   ttl = 12.0 if (now - mtime < 30.0) else 300.0
-  if cached and ((cached[0] == mtime_ns and (now - cached[1] < ttl)) or not allow_rpc):
-    return cached[2]
+  if cached:
+    c_mtime_ns, c_ts, c_res = cached
+    needs_upgrade = allow_rpc and (c_res.get("isEstimated") or (include_generations and not c_res.get("generations")))
+    if not needs_upgrade and ((c_mtime_ns == mtime_ns and (now - c_ts < ttl)) or not allow_rpc):
+      return c_res
 
   traj_resp = _call_ls("GetCascadeTrajectory", {"cascade_id": conv_id}, timeout=2.0) if allow_rpc else None
   traj = traj_resp.get("trajectory") if isinstance(traj_resp, dict) and isinstance(traj_resp.get("trajectory"), dict) else {}
@@ -842,7 +845,7 @@ def _read_transcript_steps(conv_id: str, since: int = -1) -> list[dict]:
   steps = _get_cached_transcript_bundle(conv_id)["steps"]
   if steps:
     return steps if since < 0 else [s for s in steps if s.get("step_index", -1) > since]
-  return [s for s in _synthesize_steps_from_ls_trajectory(conv_id) if s.get("step_index", -1) > since] if since <= -1 else []
+  return [s for s in _synthesize_steps_from_ls_trajectory(conv_id) if s.get("step_index", -1) > since]
 
 
 def _read_step_full(conv_id: str, step_idx: int) -> dict | None:
@@ -1238,7 +1241,7 @@ def _send_message_direct(conv_id: str, message: str, title: str = "", project_id
   if (resp2 := _call_ls("SendAgentMessage", agent_req, timeout=4.0)) is not None:
     return {"ok": True, "method": "SendAgentMessage", "conversationId": conv_id, "response": resp2}
 
-  return _run_agentapi(["send-message", *(["--title", title] if title else []), conv_id, message], project_id=project_id)
+  return _run_agentapi(["send-message", *(["--title", title] if title else []), "--", conv_id, message], project_id=project_id)
 
 
 def _start_conversation_direct(message: str, title: str = "", model_tier: str = "pro", project_id: str | None = None) -> dict:
@@ -1303,7 +1306,10 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
     self.send_header("Cache-Control", "no-store")
     self.send_header("Access-Control-Allow-Origin", "*")
     self.end_headers()
-    self.wfile.write(body)
+    try:
+      self.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError):
+      pass
 
   def _send_json(self, data: dict | list, status: int = 200):
     self._send_bytes(json.dumps(data, separators=(",", ":")).encode("utf-8"), "application/json; charset=utf-8", status=status)

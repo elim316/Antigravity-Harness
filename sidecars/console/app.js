@@ -57,7 +57,7 @@
     ["tracer-iframe", "overview-tracer-iframe"].forEach((id) => {
       const iframe = document.getElementById(id);
       if (iframe && iframe.contentWindow) {
-        iframe.contentWindow.postMessage(msg, "*");
+        iframe.contentWindow.postMessage(msg, window.location.origin);
       }
     });
   }
@@ -103,7 +103,7 @@
     });
     const iframe = document.getElementById("overview-tracer-iframe");
     if (iframe && iframe.contentWindow) {
-      iframe.contentWindow.postMessage({ type: "HARNESS_SET_VIEW_MODE", mode: state.overviewTracerMode }, "*");
+      iframe.contentWindow.postMessage({ type: "HARNESS_SET_VIEW_MODE", mode: state.overviewTracerMode }, window.location.origin);
     }
   }
 

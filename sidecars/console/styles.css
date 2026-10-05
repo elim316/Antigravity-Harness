@@ -1105,28 +1105,6 @@ body.is-dragging-card iframe {
   color: var(--text-secondary);
 }
 
-/* Tool Call Chips (Click to focus node in Agent Tracer) */
-.tool-chip-sync {
-  font-family: "JetBrains Mono", ui-monospace, monospace;
-  font-size: 10px;
-  font-weight: 600;
-  padding: 2px 7px;
-  border-radius: 5px;
-  background: var(--surface-subtle);
-  border: 1px solid var(--border);
-  color: var(--text-secondary);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  transition: all 0.12s;
-}
-.tool-chip-sync:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: var(--accent-soft);
-}
-
 /* ==========================================================================
    TAB 1: FULL CHAT VIEW
    ========================================================================== */
