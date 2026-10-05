@@ -1,12 +1,17 @@
 # Jetski Harness
 
-A unified custom UI plugin and mission control workspace for **Jetski / Antigravity** combining multi-session agent chat, an embedded execution DAG & architecture visualizer (`Agent Tracer`), cron & daemon automation controls, and real-time token, context-cache, and cost telemetry.
+[![Platform: Jetski UI Sidecar](https://img.shields.io/badge/Platform-Jetski_UI_Sidecar-4285F4?style=flat-square&logo=googlechrome&logoColor=white)](#)
+[![Backend: Python 3 Connect-RPC](https://img.shields.io/badge/Backend-Python_3_%2B_Connect--RPC-3776AB?style=flat-square&logo=python&logoColor=white)](#directory-structure)
+[![UI: Customisable 2x2 Bento Grid](https://img.shields.io/badge/UI-Customisable_2x2_Bento_Grid-0F9D58?style=flat-square)](#key-features)
+[![Telemetry: Live Token & Cache KPIs](https://img.shields.io/badge/Telemetry-Token_%26_Cache_KPIs-8E24AA?style=flat-square)](#key-features)
+
+A unified custom UI plugin and mission control workspace for **Jetski / Antigravity** combining multi-session agent chat, an embedded execution DAG and architecture visualiser ([`Agent Tracer`](https://github.com/elim316/Jetski-Agent-Tracer-Plugin)), cron and daemon automation controls, and real-time token, context-cache, and cost telemetry.
 
 ---
 
 ## Key Features
 
-1. **Customizable 2×2 Overview Bento Grid**
+1. **Customisable 2×2 Overview Bento Grid**
    - **Draggable Central Splitters:** Resize column widths and row heights on the fly (`--bento-col-split`, `--bento-row-split`), or double-click any splitter to snap back.
    - **Drag-and-Drop Card Swapping:** Grab the `⋮⋮` handle on any quadrant header to rearrange the 4 pillars in any order.
    - **One-Click Wide (`⇔`) Mode:** Expand any quadrant across both columns (`grid-column: 1 / -1`) when inspecting dense graphs or long chat streams.
