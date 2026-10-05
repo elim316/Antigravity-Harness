@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""Custom Jetski Harness & Mission Control Sidecar Backend.
+"""Custom Jetski Harness & Mission Control Sidecar Backend (v2.9).
 
 Provides:
 1. Real-time Token Usage & Cost Telemetry (via Language Server Connect-RPC
-   GetCascadeTrajectory + transcript fallback, cached by mtime).
+   GetCascadeTrajectory + transcript fallback, with model-tier-aware pricing).
 2. Live Running Agents & Conversations monitor (merges GetAllCascadeTrajectories
-   with ~/.gemini/jetski/brain/<id>/.system_generated/logs/transcript.jsonl).
+   with byte-offset incremental tailing of transcript.jsonl).
 3. Automations & Sidecars monitor (scans ~/.gemini/config/sidecars, plugins,
    and builtin sidecars; matches live OS PIDs & uptimes; translates UTC crons
-   to SGT UTC+8; reads local state trackers and sidecar logs).
-4. Jetski Runtime & Workspace MCP Status (all 9 Google Workspace MCP servers,
-   tool counts, OAuth token expiry, Memory FUSE health, Language Server status).
-5. Full compatibility & dynamic conversation switching for the user's
-   embedded Agent Tracer plugin (/tracer, /api/transcript, /api/step_full,
-   /api/update-status, /api/update).
-6. Agent dispatch endpoints (/_sidecar/send-message, /_sidecar/new-conversation,
-   /api/harness/trigger-automation).
+   to SGT UTC+8; reads local JSON state trackers and sidecar logs).
+4. Jetski Runtime & Workspace MCP Status (Google Workspace MCP servers,
+   tool counts, OAuth token status, Memory FUSE health, Language Server status).
+5. Full compatibility & dynamic conversation switching for the embedded Agent
+   Tracer view (/tracer, /api/transcript, /api/step_full, /api/subagents_status,
+   /api/telemetry, /api/conversations, /api/update-status, /api/update).
+6. Agent dispatch endpoints (/api/chat/send, /api/chat/stop, /api/automation/toggle,
+   /api/automation/trigger, /_sidecar/send-message, /_sidecar/new-conversation).
 """
 
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -43,9 +43,14 @@ TRACER_DIR = os.path.join(
 PRELOAD_SDK_PATH = os.path.join(BASE_DIR, "preload.js")
 
 SGT_TZ = timezone(timedelta(hours=8), name="SGT")
+_UUID_RE = re.compile(r"^[a-fA-F0-9-]+$")
+_CONV_DIR_RE = re.compile(r"^[a-fA-F0-9-]{20,}$")
 
-# Auto-reload watcher: exit cleanly when server.py is edited so the sidecar
-# supervisor (restart_policy: "always") restarts with the latest code.
+# Bypass corporate/Cloudtop HTTP proxy for all 127.0.0.1 Language Server RPC calls
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# Single auto-reload watcher: exit cleanly when server.py is modified so
+# SidecarManager (restart_policy: "always") respawns with updated code.
 _SELF_FILE = os.path.abspath(__file__)
 try:
   _STARTUP_MTIME = os.path.getmtime(_SELF_FILE)
@@ -55,10 +60,13 @@ except OSError:
 
 def _watch_self():
   while True:
-    time.sleep(1.5)
+    time.sleep(5.0)
     try:
       if _STARTUP_MTIME and os.path.getmtime(_SELF_FILE) != _STARTUP_MTIME:
-        print("[jetski-harness] server.py modified, exiting for auto-restart...", flush=True)
+        print(
+            "[jetski-harness] server.py modified, exiting for auto-restart...",
+            flush=True,
+        )
         os._exit(0)
     except OSError:
       pass
@@ -66,15 +74,63 @@ def _watch_self():
 
 threading.Thread(target=_watch_self, daemon=True).start()
 
-# In-memory caches to keep 2s UI polling fast (<25ms)
+# Thread-safe bounded LRU caches
+_CACHE_LOCK = threading.Lock()
+_MAX_CONV_CACHE = 64
+
 _LS_CONN_CACHE = {"address": None, "csrf": None, "pid": None, "checked_at": 0.0}
-_TRANSCRIPT_META_CACHE = {}  # conv_id -> (mtime, dict)
-_TOKEN_USAGE_CACHE = {}      # conv_id -> (mtime, float_ts, dict)
+_STEP_CACHE: OrderedDict[str, dict] = OrderedDict()
+_FULL_STEP_CONTENT_CACHE: OrderedDict[tuple[str, int], dict] = OrderedDict()
+_TOKEN_USAGE_CACHE: OrderedDict[str, tuple[int, float, dict]] = OrderedDict()
+_CHAT_STREAM_CACHE: OrderedDict[str, tuple[int, int, dict]] = OrderedDict()
+_STATIC_FILE_CACHE: dict[str, tuple[int, int, bytes]] = {}
 _UPDATE_CACHE = {"data": None, "ts": 0.0}
 _UPDATE_TTL = 300.0
 
+_LS_TRAJECTORIES_CACHE = {"ts": 0.0, "summaries": {}}
+_BRAIN_ENTRIES_CACHE = {"ts": 0.0, "ids": set()}
+_AUTOMATIONS_CACHE = {"ts": 0.0, "data": []}
+_RUNTIME_STATUS_CACHE = {"ts": 0.0, "data": {}}
+_MODEL_LABEL_CACHE = {"ts": 0.0, "map": {}}
 
-def _discover_language_server(force=False):
+
+def _lru_get(cache: OrderedDict, key: str):
+  with _CACHE_LOCK:
+    if key in cache:
+      cache.move_to_end(key)
+      return cache[key]
+    return None
+
+
+def _lru_set(cache: OrderedDict, key: str, value, max_size: int = _MAX_CONV_CACHE):
+  with _CACHE_LOCK:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+      cache.popitem(last=False)
+
+
+def _read_cached_file_bytes(fpath: str) -> bytes | None:
+  """Reads static file bytes with in-memory mtime_ns caching."""
+  try:
+    st = os.stat(fpath)
+  except OSError:
+    return None
+  with _CACHE_LOCK:
+    cached = _STATIC_FILE_CACHE.get(fpath)
+    if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+      return cached[2]
+  try:
+    with open(fpath, "rb") as f:
+      data = f.read()
+  except OSError:
+    return None
+  with _CACHE_LOCK:
+    _STATIC_FILE_CACHE[fpath] = (st.st_mtime_ns, st.st_size, data)
+  return data
+
+
+def _discover_language_server(force: bool = False):
   """Finds the active Jetski Language Server HTTP address and CSRF token."""
   now = time.time()
   if (
@@ -83,7 +139,11 @@ def _discover_language_server(force=False):
       and _LS_CONN_CACHE["csrf"]
       and (now - _LS_CONN_CACHE["checked_at"] < 30.0)
   ):
-    return _LS_CONN_CACHE["address"], _LS_CONN_CACHE["csrf"], _LS_CONN_CACHE["pid"]
+    return (
+        _LS_CONN_CACHE["address"],
+        _LS_CONN_CACHE["csrf"],
+        _LS_CONN_CACHE["pid"],
+    )
 
   env_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS")
   env_csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
@@ -93,7 +153,6 @@ def _discover_language_server(force=False):
     )
     return env_addr, env_csrf, None
 
-  # Fallback: scan /proc for language_server_linux_x64
   try:
     res = subprocess.run(
         ["ps", "-eo", "pid,args"],
@@ -106,13 +165,11 @@ def _discover_language_server(force=False):
         parts = line.strip().split(None, 1)
         if len(parts) < 2:
           continue
-        pid = parts[0]
-        cmd = parts[1]
+        pid, cmd = parts[0], parts[1]
         csrf_m = re.search(r"--csrf_token[=\s]+([a-fA-F0-9-]+)", cmd)
         if not csrf_m:
           continue
         csrf = csrf_m.group(1)
-        # Find listening ports for this PID via ss
         ss_res = subprocess.run(
             ["ss", "-tlpn"],
             capture_output=True,
@@ -125,7 +182,6 @@ def _discover_language_server(force=False):
             pm = re.search(r"127\.0\.0\.1:(\d+)", sline)
             if pm:
               ports.append(int(pm.group(1)))
-        # Test which port speaks Connect-RPC LanguageServerService
         for pt in sorted(ports):
           addr = f"127.0.0.1:{pt}"
           try:
@@ -138,11 +194,14 @@ def _discover_language_server(force=False):
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=0.8) as resp:
+            with _NO_PROXY_OPENER.open(req, timeout=0.8) as resp:
               if resp.status == 200:
-                _LS_CONN_CACHE.update(
-                    {"address": addr, "csrf": csrf, "pid": int(pid), "checked_at": now}
-                )
+                _LS_CONN_CACHE.update({
+                    "address": addr,
+                    "csrf": csrf,
+                    "pid": int(pid),
+                    "checked_at": now,
+                })
                 return addr, csrf, int(pid)
           except Exception:
             continue
@@ -169,10 +228,9 @@ def _call_ls(method: str, payload: dict | None = None, timeout: float = 1.5):
           },
           method="POST",
       )
-      with urllib.request.urlopen(req, timeout=timeout) as resp:
+      with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError:
-      # HTTP error from LS means the port/CSRF is alive, just method/cascade error
       return None
     except Exception:
       if attempt == 0:
@@ -195,168 +253,282 @@ def _parse_duration_seconds(val) -> float:
   return 0.0
 
 
-def _estimate_cost_usd(uncached_in: int, output_tok: int, thinking_tok: int, cache_tok: int) -> float:
-  """Estimates USD cost using standard Gemini Pro pricing tiers."""
-  # $1.25 / 1M uncached input, $0.3125 / 1M cached input, $10.00 / 1M output+thinking
+# Model-tier-aware pricing rates (USD per 1M tokens)
+_MODEL_PRICING_TIERS = {
+    "flash_lite": {"inputPer1M": 0.10, "cachedPer1M": 0.025, "outputPer1M": 0.40},
+    "flash": {"inputPer1M": 0.30, "cachedPer1M": 0.075, "outputPer1M": 2.50},
+    "claude_opus": {"inputPer1M": 15.00, "cachedPer1M": 1.50, "outputPer1M": 75.00},
+    "claude_sonnet": {"inputPer1M": 3.00, "cachedPer1M": 0.30, "outputPer1M": 15.00},
+    "pro": {"inputPer1M": 1.25, "cachedPer1M": 0.3125, "outputPer1M": 10.00},
+}
+
+
+def _get_pricing_rates(model_label: str = "", raw_model: str = "") -> dict:
+  """Selects pricing rates based on resolved model label or enum."""
+  combined = f"{model_label} {raw_model}".lower()
+  if "flash lite" in combined or "flash_lite" in combined or "m198" in combined:
+    return _MODEL_PRICING_TIERS["flash_lite"]
+  if "flash" in combined or any(k in combined for k in ("m196", "m200", "m264", "m265", "m298")):
+    return _MODEL_PRICING_TIERS["flash"]
+  if "opus" in combined or "m65" in combined:
+    return _MODEL_PRICING_TIERS["claude_opus"]
+  if "sonnet" in combined or "claude" in combined or "m64" in combined:
+    return _MODEL_PRICING_TIERS["claude_sonnet"]
+  return _MODEL_PRICING_TIERS["pro"]
+
+
+def _estimate_cost_usd(
+    uncached_in: int,
+    output_tok: int,
+    thinking_tok: int,
+    cache_tok: int,
+    model_label: str = "",
+    raw_model: str = "",
+) -> float:
+  """Estimates USD cost using model-tier-aware pricing rates."""
+  rates = _get_pricing_rates(model_label, raw_model)
   cost = (
-      (max(0, uncached_in) / 1_000_000.0) * 1.25
-      + (max(0, cache_tok) / 1_000_000.0) * 0.3125
-      + (max(0, output_tok + thinking_tok) / 1_000_000.0) * 10.0
+      (max(0, uncached_in) / 1_000_000.0) * rates["inputPer1M"]
+      + (max(0, cache_tok) / 1_000_000.0) * rates["cachedPer1M"]
+      + (max(0, output_tok + thinking_tok) / 1_000_000.0) * rates["outputPer1M"]
   )
   return round(cost, 4)
 
 
 def _get_transcript_path(conv_id: str, full: bool = False) -> str | None:
-  if not conv_id or not re.match(r"^[a-fA-F0-9-]+$", conv_id):
+  if not conv_id or not _UUID_RE.match(conv_id):
     return None
   fname = "transcript_full.jsonl" if full else "transcript.jsonl"
   for app_name in ("jetski", "antigravity"):
     candidate = os.path.join(
-        HOME_DIR, ".gemini", app_name, "brain", conv_id, ".system_generated", "logs", fname
+        HOME_DIR,
+        ".gemini",
+        app_name,
+        "brain",
+        conv_id,
+        ".system_generated",
+        "logs",
+        fname,
     )
     if os.path.isfile(candidate):
       return candidate
   return os.path.join(BRAIN_DIR, conv_id, ".system_generated", "logs", fname)
 
 
-def _summarize_transcript_fast(conv_id: str) -> dict:
-  """Reads transcript.jsonl metadata with mtime caching."""
+def _get_cached_transcript_bundle(conv_id: str) -> dict:
+  """Incrementally tails transcript.jsonl by byte offset and maintains both parsed steps and summary metadata."""
   tpath = _get_transcript_path(conv_id, full=False)
   if not tpath or not os.path.isfile(tpath):
     return {
         "exists": False,
-        "stepCount": 0,
-        "toolCallCount": 0,
-        "subagentCount": 0,
-        "title": "",
-        "status": "IDLE",
-        "lastStepType": "",
-        "lastAction": "",
-        "updatedAt": "",
-        "createdAt": "",
-        "charCount": 0,
+        "mtime": 0.0,
+        "mtime_ns": 0,
+        "size": 0,
+        "steps": [],
+        "summary": {
+            "exists": False,
+            "stepCount": 0,
+            "toolCallCount": 0,
+            "subagentCount": 0,
+            "title": "",
+            "status": "IDLE",
+            "turnCompleted": False,
+            "lastStepType": "",
+            "lastAction": "",
+            "updatedAt": "",
+            "createdAt": "",
+            "charCount": 0,
+            "mtime": 0.0,
+        },
     }
+
   try:
     st = os.stat(tpath)
     mtime = st.st_mtime
+    mtime_ns = st.st_mtime_ns
+    fsize = st.st_size
   except OSError:
-    mtime = 0.0
+    mtime, mtime_ns, fsize = 0.0, 0, 0
 
-  cached = _TRANSCRIPT_META_CACHE.get(conv_id)
-  if cached and cached[0] == mtime:
-    return cached[1]
+  cached = _lru_get(_STEP_CACHE, conv_id)
+  if cached and cached["mtime_ns"] == mtime_ns and cached["size"] == fsize:
+    # Re-evaluate time-dependent status if the file was modified recently
+    summary = cached["summary"]
+    if mtime and (time.time() - mtime < 30.0):
+      summary = dict(summary)
+      summary["status"] = _compute_step_status(
+          summary.get("lastStepType", ""),
+          summary.get("lastStepStatus", ""),
+          summary.get("turnCompleted", False),
+          mtime,
+      )
+    return {**cached, "summary": summary}
 
-  step_count = 0
-  tool_count = 0
-  subagent_count = 0
-  first_user_text = ""
-  created_at = ""
-  updated_at = ""
-  last_step_type = ""
-  last_step_status = ""
-  last_step_has_tools = False
-  last_step_has_content = False
-  last_action = ""
-  char_count = 0
+  # Determine whether we can incrementally read from the previous byte offset
+  if cached and fsize >= cached["offset"] and cached["offset"] > 0:
+    offset = cached["offset"]
+    steps = list(cached["steps"])
+    meta_state = dict(cached["meta_state"])
+  else:
+    offset = 0
+    steps = []
+    meta_state = {
+        "step_count": 0,
+        "tool_count": 0,
+        "subagent_count": 0,
+        "first_user_text": "",
+        "created_at": "",
+        "updated_at": "",
+        "last_step_type": "",
+        "last_step_status": "",
+        "last_step_has_tools": False,
+        "last_step_has_content": False,
+        "last_action": "",
+        "char_count": 0,
+    }
 
   try:
-    with open(tpath, "r", encoding="utf-8", errors="replace") as f:
-      for raw in f:
-        line = raw.strip()
-        if not line:
-          continue
-        char_count += len(line)
-        try:
-          obj = json.loads(line)
-        except json.JSONDecodeError:
-          continue
-        step_count += 1
-        stype = obj.get("type", "")
-        sstatus = obj.get("status", "")
-        screated = obj.get("created_at", "")
-        if not created_at and screated:
-          created_at = screated
-        if screated:
-          updated_at = screated
-        last_step_type = stype
-        last_step_status = sstatus
-
-        if stype == "USER_INPUT" and not first_user_text:
-          content = (obj.get("content") or "").strip()
-          content = re.sub(r"</?USER_REQUEST>", "", content).strip()
-          if content:
-            first_user_text = content.splitlines()[0][:90]
-
-        tcalls = obj.get("tool_calls") or []
-        if stype == "PLANNER_RESPONSE":
-          last_step_has_tools = bool(isinstance(tcalls, list) and tcalls)
-          last_step_has_content = bool((obj.get("content") or "").strip())
-
-        if isinstance(tcalls, list) and tcalls:
-          tool_count += len(tcalls)
-          for tc in tcalls:
-            tname = tc.get("name", "")
-            if tname == "invoke_subagent":
-              subagent_count += 1
-            args = tc.get("arguments") or tc.get("args") or {}
-            if isinstance(args, dict):
-              summary = (
-                  args.get("toolAction")
-                  or args.get("toolSummary")
-                  or tname
-              )
-              if isinstance(summary, str):
-                summary = summary.strip().strip('"').strip()
-              if summary:
-                last_action = f"{summary}"
+    with open(tpath, "rb") as f:
+      if offset > 0:
+        f.seek(offset)
+      raw_chunk = f.read()
+      new_offset = f.tell()
   except OSError:
-    pass
+    raw_chunk = b""
+    new_offset = offset
 
+  if raw_chunk:
+    # Only process complete newline-terminated lines so partial writes are retried next poll
+    last_nl = raw_chunk.rfind(b"\n")
+    if last_nl == -1:
+      processable = b""
+      new_offset = offset
+    else:
+      processable = raw_chunk[: last_nl + 1]
+      new_offset = offset + last_nl + 1
+
+    for raw_line in processable.decode("utf-8", errors="replace").splitlines():
+      line = raw_line.strip()
+      if not line:
+        continue
+      meta_state["char_count"] += len(line)
+      try:
+        obj = json.loads(line)
+      except json.JSONDecodeError:
+        continue
+
+      steps.append(obj)
+      meta_state["step_count"] += 1
+      stype = obj.get("type", "")
+      sstatus = obj.get("status", "")
+      screated = obj.get("created_at", "")
+      if not meta_state["created_at"] and screated:
+        meta_state["created_at"] = screated
+      if screated:
+        meta_state["updated_at"] = screated
+      meta_state["last_step_type"] = stype
+      meta_state["last_step_status"] = sstatus
+
+      if stype == "USER_INPUT" and not meta_state["first_user_text"]:
+        content = (obj.get("content") or "").strip()
+        content = re.sub(r"</?USER_REQUEST>", "", content).strip()
+        if content:
+          meta_state["first_user_text"] = content.splitlines()[0][:90]
+
+      tcalls = obj.get("tool_calls") or []
+      if stype == "PLANNER_RESPONSE":
+        meta_state["last_step_has_tools"] = bool(isinstance(tcalls, list) and tcalls)
+        meta_state["last_step_has_content"] = bool((obj.get("content") or "").strip())
+
+      if isinstance(tcalls, list) and tcalls:
+        meta_state["tool_count"] += len(tcalls)
+        for tc in tcalls:
+          tname = tc.get("name", "")
+          if tname == "invoke_subagent":
+            meta_state["subagent_count"] += 1
+          args = tc.get("arguments") or tc.get("args") or {}
+          if isinstance(args, dict):
+            summary_str = args.get("toolAction") or args.get("toolSummary") or tname
+            if isinstance(summary_str, str):
+              summary_str = summary_str.strip().strip('"').strip()
+            if summary_str:
+              meta_state["last_action"] = summary_str
+
+  updated_at = meta_state["updated_at"]
   if not updated_at and mtime:
     updated_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
-  # Determine status heuristic if LS doesn't override:
-  # If the last step is a DONE PLANNER_RESPONSE with final content and zero tool_calls, the turn is IDLE.
-  age_sec = time.time() - mtime if mtime else 999999
   turn_completed = (
-      last_step_type == "PLANNER_RESPONSE"
-      and last_step_status == "DONE"
-      and last_step_has_content
-      and not last_step_has_tools
+      meta_state["last_step_type"] == "PLANNER_RESPONSE"
+      and meta_state["last_step_status"] == "DONE"
+      and meta_state["last_step_has_content"]
+      and not meta_state["last_step_has_tools"]
   )
-  if last_step_status in ("RUNNING", "IN_PROGRESS", "PENDING"):
-    status = "RUNNING"
-  elif not turn_completed and age_sec < 15 and last_step_type in ("USER_INPUT", "PLANNER_RESPONSE", "GENERIC"):
-    status = "RUNNING"
-  elif last_step_status == "ERROR":
-    status = "ERROR"
-  else:
-    status = "IDLE"
+  status = _compute_step_status(
+      meta_state["last_step_type"],
+      meta_state["last_step_status"],
+      turn_completed,
+      mtime,
+  )
 
-  info = {
+  summary = {
       "exists": True,
-      "stepCount": step_count,
-      "toolCallCount": tool_count,
-      "subagentCount": subagent_count,
-      "title": first_user_text,
+      "stepCount": meta_state["step_count"],
+      "toolCallCount": meta_state["tool_count"],
+      "subagentCount": meta_state["subagent_count"],
+      "title": meta_state["first_user_text"],
       "status": status,
       "turnCompleted": turn_completed,
-      "lastStepType": last_step_type,
-      "lastAction": last_action,
+      "lastStepType": meta_state["last_step_type"],
+      "lastStepStatus": meta_state["last_step_status"],
+      "lastAction": meta_state["last_action"],
       "updatedAt": updated_at,
-      "createdAt": created_at,
-      "charCount": char_count,
+      "createdAt": meta_state["created_at"],
+      "charCount": meta_state["char_count"],
       "mtime": mtime,
   }
-  _TRANSCRIPT_META_CACHE[conv_id] = (mtime, info)
-  return info
+
+  bundle = {
+      "exists": True,
+      "mtime": mtime,
+      "mtime_ns": mtime_ns,
+      "size": fsize,
+      "offset": new_offset,
+      "steps": steps,
+      "meta_state": meta_state,
+      "summary": summary,
+  }
+  _lru_set(_STEP_CACHE, conv_id, bundle)
+  return bundle
 
 
-_MODEL_LABEL_CACHE = {"ts": 0.0, "map": {}}
+def _compute_step_status(
+    last_step_type: str, last_step_status: str, turn_completed: bool, mtime: float
+) -> str:
+  age_sec = time.time() - mtime if mtime else 999999.0
+  if last_step_status in ("RUNNING", "IN_PROGRESS", "PENDING"):
+    return "RUNNING"
+  if not turn_completed and age_sec < 15.0 and last_step_type in (
+      "USER_INPUT",
+      "PLANNER_RESPONSE",
+      "GENERIC",
+  ):
+    return "RUNNING"
+  if last_step_status == "ERROR":
+    return "ERROR"
+  return "IDLE"
+
+
+def _summarize_transcript_fast(conv_id: str) -> dict:
+  """Returns transcript summary metadata from the shared incremental step cache."""
+  return _get_cached_transcript_bundle(conv_id)["summary"]
+
 
 _KNOWN_PLACEHOLDER_LABELS = {
     "MODEL_PLACEHOLDER_M260": "Gemini Next",
     "MODEL_PLACEHOLDER_M37": "Gemini Pro",
+    "MODEL_PLACEHOLDER_M64": "Claude Sonnet 4.6 (Thinking)",
+    "MODEL_PLACEHOLDER_M65": "Claude Opus 4.6 (Thinking)",
     "MODEL_PLACEHOLDER_M256": "Gemini 3.5 Pro",
     "MODEL_PLACEHOLDER_M257": "Gemini 3.5 Pro (Low Thinking)",
     "MODEL_PLACEHOLDER_M273": "Gemini 3.5 Pro",
@@ -404,21 +576,27 @@ def _get_model_display_name(raw_model: str) -> str:
     return mapped
   if raw_model.startswith("MODEL_PLACEHOLDER_"):
     return "Gemini Next"
-  return raw_model.replace("MODEL_GOOGLE_", "").replace("MODEL_", "").replace("_", " ").title()
+  return (
+      raw_model.replace("MODEL_GOOGLE_", "")
+      .replace("MODEL_", "")
+      .replace("_", " ")
+      .title()
+  )
 
 
 def _get_token_telemetry(
     conv_id: str, include_generations: bool = True, allow_rpc: bool = True
 ) -> dict:
   """Fetches exact token telemetry for conv_id via GetCascadeTrajectory."""
-  tmeta = _summarize_transcript_fast(conv_id)
+  bundle = _get_cached_transcript_bundle(conv_id)
+  tmeta = bundle["summary"]
+  mtime_ns = bundle["mtime_ns"]
   mtime = tmeta.get("mtime", 0.0)
   now = time.time()
 
-  cached = _TOKEN_USAGE_CACHE.get(conv_id)
-  # Reuse cached result if transcript hasn't changed and cache is <12s old (or <300s for older convs)
+  cached = _lru_get(_TOKEN_USAGE_CACHE, conv_id)
   ttl = 12.0 if (now - mtime < 30.0) else 300.0
-  if cached and cached[0] == mtime and (now - cached[1] < ttl):
+  if cached and cached[0] == mtime_ns and (now - cached[1] < ttl):
     return cached[2]
   if not allow_rpc and cached:
     return cached[2]
@@ -457,8 +635,6 @@ def _get_token_telemetry(
       if prov:
         api_provider = prov.replace("API_PROVIDER_", "")
 
-      # In LanguageServer proto, usage.inputTokens is uncached input tokens,
-      # while usage.cacheReadTokens is cached context tokens read.
       i_t = int(usage.get("inputTokens") or 0)
       o_t = int(usage.get("outputTokens") or 0)
       th_t = int(usage.get("thinkingOutputTokens") or 0)
@@ -501,16 +677,21 @@ def _get_token_telemetry(
         else 0.0
     )
     last_gen = generations[-1] if generations else {}
-    context_window_tokens = last_gen.get("inputTokens", 0) + last_gen.get("outputTokens", 0)
+    context_window_tokens = last_gen.get("inputTokens", 0) + last_gen.get(
+        "outputTokens", 0
+    )
     raw_m = model_name or "MODEL_PLACEHOLDER_M260"
+    resolved_label = _get_model_display_name(raw_m)
     recent_gens = generations[-24:]
+    pricing_rates = _get_pricing_rates(resolved_label, raw_m)
 
     result = {
         "conversationId": conv_id,
         "isEstimated": False,
         "lsStatus": ls_status,
-        "model": _get_model_display_name(raw_m),
+        "model": resolved_label,
         "rawModel": raw_m,
+        "pricingRates": pricing_rates,
         "apiProvider": api_provider or "INTERNAL",
         "llmCalls": len(generations),
         "inputTokens": total_prompt_tok,
@@ -523,59 +704,63 @@ def _get_token_telemetry(
         "totalTokens": total_tok,
         "cacheHitRatePct": cache_hit_pct,
         "contextWindowTokens": context_window_tokens,
-        "estimatedCostUsd": _estimate_cost_usd(uncached_in_tok, out_tok, think_tok, cache_tok),
+        "estimatedCostUsd": _estimate_cost_usd(
+            uncached_in_tok, out_tok, think_tok, cache_tok, resolved_label, raw_m
+        ),
         "avgTtftSeconds": round(ttft_sum / ttft_count, 2) if ttft_count else 0.0,
         "totalStreamingSeconds": round(stream_sum, 1),
         "lastTurn": last_gen,
-        "generations": recent_gens,
-        "perTurn": recent_gens,
+        "generations": recent_gens if include_generations else [],
+        "perTurn": recent_gens if include_generations else [],
     }
-    _TOKEN_USAGE_CACHE[conv_id] = (mtime, now, result)
+    _lru_set(_TOKEN_USAGE_CACHE, conv_id, (mtime_ns, now, result))
     return result
 
   # Fallback estimation from transcript character count if trajectory isn't in LS memory
   est_out = max(1, tmeta.get("charCount", 0) // 4)
   est_in = est_out * max(1, min(tmeta.get("stepCount", 1), 12))
   est_cache = int(est_in * 0.78)
+  est_uncached = max(0, est_in - est_cache)
+  est_think = int(est_out * 0.35)
+  default_label = _get_model_display_name("MODEL_PLACEHOLDER_M260")
   result = {
       "conversationId": conv_id,
       "isEstimated": True,
       "lsStatus": ls_status or "ARCHIVED",
-      "model": _get_model_display_name("MODEL_PLACEHOLDER_M260"),
+      "model": default_label,
       "rawModel": "MODEL_PLACEHOLDER_M260",
+      "pricingRates": _get_pricing_rates(default_label, "MODEL_PLACEHOLDER_M260"),
       "apiProvider": "GOOGLE_GEMINI_INTERNAL",
       "llmCalls": max(1, tmeta.get("stepCount", 1) // 2),
       "inputTokens": est_in,
       "promptTokens": est_in,
-      "uncachedInputTokens": max(0, est_in - est_cache),
+      "uncachedInputTokens": est_uncached,
       "outputTokens": est_out,
-      "thinkingTokens": int(est_out * 0.35),
+      "thinkingTokens": est_think,
       "cacheReadTokens": est_cache,
       "cachedTokens": est_cache,
       "totalTokens": est_in + est_out,
       "cacheHitRatePct": 78.0 if est_in > 0 else 0.0,
       "contextWindowTokens": min(est_in, 128000),
-      "estimatedCostUsd": _estimate_cost_usd(est_in, est_out, int(est_out * 0.35), est_cache),
+      "estimatedCostUsd": _estimate_cost_usd(
+          est_uncached, est_out, est_think, est_cache, default_label
+      ),
       "avgTtftSeconds": 0.0,
       "totalStreamingSeconds": 0.0,
       "lastTurn": {},
       "generations": [],
       "perTurn": [],
   }
-  _TOKEN_USAGE_CACHE[conv_id] = (mtime, now, result)
+  _lru_set(_TOKEN_USAGE_CACHE, conv_id, (mtime_ns, now, result))
   return result
-
-
-_LS_TRAJECTORIES_CACHE = {"ts": 0.0, "summaries": {}}
-_BRAIN_ENTRIES_CACHE = {"ts": 0.0, "ids": set()}
-_AUTOMATIONS_CACHE = {"ts": 0.0, "data": []}
-_RUNTIME_STATUS_CACHE = {"ts": 0.0, "data": {}}
 
 
 def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
   """Lists recent/active conversations and computes global token summary."""
   now = time.time()
-  if _LS_TRAJECTORIES_CACHE["summaries"] and (now - _LS_TRAJECTORIES_CACHE["ts"] < 6.0):
+  if _LS_TRAJECTORIES_CACHE["summaries"] and (
+      now - _LS_TRAJECTORIES_CACHE["ts"] < 6.0
+  ):
     summaries = _LS_TRAJECTORIES_CACHE["summaries"]
   else:
     ls_all = _call_ls("GetAllCascadeTrajectories", {}, timeout=1.8) or {}
@@ -589,7 +774,7 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
     brain_ids = set()
     try:
       for entry in os.listdir(BRAIN_DIR):
-        if re.match(r"^[a-fA-F0-9-]{20,}$", entry):
+        if _CONV_DIR_RE.match(entry):
           tpath = _get_transcript_path(entry, full=False)
           if tpath and os.path.isfile(tpath):
             brain_ids.add(entry)
@@ -610,8 +795,11 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
     else:
       status = tmeta["status"]
 
-    if cid == active_conv_id and status == "IDLE" and not tmeta.get("turnCompleted"):
-      # Check if modified within last 12 seconds while turn is still in progress
+    if (
+        cid == active_conv_id
+        and status == "IDLE"
+        and not tmeta.get("turnCompleted")
+    ):
       if time.time() - tmeta.get("mtime", 0) < 12:
         status = "RUNNING"
 
@@ -630,7 +818,9 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
         or tmeta.get("createdAt")
         or ""
     )
-    step_count = max(int(ls_info.get("stepCount") or 0), tmeta.get("stepCount", 0))
+    step_count = max(
+        int(ls_info.get("stepCount") or 0), tmeta.get("stepCount", 0)
+    )
 
     workspaces = ls_info.get("workspaces") or []
     ws_label = "No Workspace (Scratch)"
@@ -641,13 +831,17 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
 
     items.append({
         "id": cid,
+        "conversationId": cid,
         "title": title,
         "status": status,
         "isRunning": status == "RUNNING",
         "stepCount": step_count,
+        "steps": step_count,
         "toolCallCount": tmeta.get("toolCallCount", 0),
         "subagentCount": tmeta.get("subagentCount", 0),
-        "lastAction": tmeta.get("lastAction") or tmeta.get("lastStepType") or "Idle",
+        "lastAction": (
+            tmeta.get("lastAction") or tmeta.get("lastStepType") or "Idle"
+        ),
         "updatedAt": updated_at,
         "createdAt": created_at,
         "workspace": ws_label,
@@ -655,7 +849,6 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
         "mtime": tmeta.get("mtime", 0.0),
     })
 
-  # Sort strictly by updatedAt / mtime descending so the dropdown order stays stable during polling
   items.sort(
       key=lambda x: (
           x["updatedAt"] or "",
@@ -667,8 +860,6 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
 
   top_items = items[:18]
 
-  # Aggregate global token telemetry across top 6 most recent conversations.
-  # Only issue live GetCascadeTrajectory RPC for active_conv_id; use cache/fast estimation for the rest.
   global_in = 0
   global_out = 0
   global_think = 0
@@ -705,7 +896,11 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
       "cacheReadTokens": global_cache,
       "cachedTokens": global_cache,
       "totalTokens": global_in + global_out + global_think,
-      "cacheHitRatePct": round((global_cache / global_in) * 100.0, 1) if global_in > 0 else 0.0,
+      "cacheHitRatePct": (
+          round((global_cache / global_in) * 100.0, 1)
+          if global_in > 0
+          else 0.0
+      ),
       "estimatedCostUsd": round(global_cost, 4),
       "llmCalls": global_calls,
   }
@@ -732,7 +927,7 @@ def _cron_utc_to_sgt_label(cron_expr: str) -> str:
   parts = cron_expr.strip().split()
   if len(parts) != 5:
     return cron_expr
-  minute, hour, dom, month, dow = parts
+  minute, hour, _dom, _month, dow = parts
   dow_label = {
       "*": "Daily",
       "1-5": "Weekdays (Mon–Fri)",
@@ -741,7 +936,10 @@ def _cron_utc_to_sgt_label(cron_expr: str) -> str:
 
   if hour.isdigit() and minute.isdigit():
     sgt_h = (int(hour) + 8) % 24
-    return f"{dow_label} at {sgt_h:02d}:{int(minute):02d} SGT ({int(hour):02d}:{int(minute):02d} UTC)"
+    return (
+        f"{dow_label} at {sgt_h:02d}:{int(minute):02d} SGT"
+        f" ({int(hour):02d}:{int(minute):02d} UTC)"
+    )
   if hour == "*" and minute.isdigit():
     return f"Hourly at :{int(minute):02d} SGT/UTC ({dow_label})"
   if hour == "22-23,0-11" and minute.isdigit():
@@ -749,13 +947,43 @@ def _cron_utc_to_sgt_label(cron_expr: str) -> str:
   return f"{cron_expr} UTC (SGT = UTC+8)"
 
 
+_IGNORED_STATE_JSON_FILES = frozenset({
+    "sidecar.json",
+    "plugin.json",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+})
+
+
+def _inspect_sidecar_state_badge(sdir: str) -> str:
+  """Dynamically inspects any local JSON state tracker in a sidecar directory."""
+  try:
+    for fname in sorted(os.listdir(sdir)):
+      if not fname.endswith(".json") or fname in _IGNORED_STATE_JSON_FILES:
+        continue
+      fpath = os.path.join(sdir, fname)
+      if not os.path.isfile(fpath):
+        continue
+      with open(fpath, "r", encoding="utf-8") as cf:
+        cdata = json.load(cf)
+      if isinstance(cdata, (list, dict)):
+        return f"{len(cdata)} items tracked"
+  except Exception:
+    pass
+  return ""
+
+
 def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
   """Discovers all configured automations & sidecars and matches live OS processes."""
   now = time.time()
-  if not force and _AUTOMATIONS_CACHE["data"] and (now - _AUTOMATIONS_CACHE["ts"] < 30.0):
+  if (
+      not force
+      and _AUTOMATIONS_CACHE["data"]
+      and (now - _AUTOMATIONS_CACHE["ts"] < 30.0)
+  ):
     return _AUTOMATIONS_CACHE["data"]
 
-  # 1. Snapshot live processes
   procs = []
   try:
     res = subprocess.run(
@@ -782,17 +1010,16 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
   except Exception:
     pass
 
-  # 2. Discover all sidecar manifests
   manifests = []
-  # Loose sidecars in ~/.gemini/config/sidecars/<id>/sidecar.json
   loose_root = os.path.join(CONFIG_DIR, "sidecars")
   if os.path.isdir(loose_root):
     for name in sorted(os.listdir(loose_root)):
       sjson = os.path.join(loose_root, name, "sidecar.json")
       if os.path.isfile(sjson):
-        manifests.append((name, "user-sidecar", os.path.join(loose_root, name), sjson))
+        manifests.append(
+            (name, "user-sidecar", os.path.join(loose_root, name), sjson)
+        )
 
-  # Plugin sidecars in ~/.gemini/config/plugins/<plugin>/sidecars/<sname>/sidecar.json
   plugins_root = os.path.join(CONFIG_DIR, "plugins")
   if os.path.isdir(plugins_root):
     for pname in sorted(os.listdir(plugins_root)):
@@ -810,9 +1037,13 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
         for sname in sorted(os.listdir(sdir_root)):
           sjson = os.path.join(sdir_root, sname, "sidecar.json")
           if os.path.isfile(sjson):
-            manifests.append((f"{declared_name}/{sname}", "ui-plugin", os.path.join(sdir_root, sname), sjson))
+            manifests.append((
+                f"{declared_name}/{sname}",
+                "ui-plugin",
+                os.path.join(sdir_root, sname),
+                sjson,
+            ))
 
-  # Builtin plugin sidecars in ~/.gemini/jetski/builtin/plugins/<plugin>/sidecars/<sname>/sidecar.json
   builtin_root = os.path.join(JETSKI_DIR, "builtin", "plugins")
   if os.path.isdir(builtin_root):
     for pname in sorted(os.listdir(builtin_root)):
@@ -821,7 +1052,12 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
         for sname in sorted(os.listdir(sdir_root)):
           sjson = os.path.join(sdir_root, sname, "sidecar.json")
           if os.path.isfile(sjson):
-            manifests.append((f"{pname}/{sname}", "builtin-sidecar", os.path.join(sdir_root, sname), sjson))
+            manifests.append((
+                f"{pname}/{sname}",
+                "builtin-sidecar",
+                os.path.join(sdir_root, sname),
+                sjson,
+            ))
 
   results = []
   for sid, source_type, sdir, sjson_path in manifests:
@@ -835,11 +1071,19 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
     cmd_name = cfg.get("command", "")
     args = cfg.get("args") or []
     has_web_ui = bool(cfg.get("has_web_ui"))
-    display_name = cfg.get("display_name") or (cfg.get("ui_config") or {}).get("title") or sid
+    display_name = (
+        cfg.get("display_name")
+        or (cfg.get("ui_config") or {}).get("title")
+        or sid
+    )
     description = cfg.get("description") or ""
     restart_policy = cfg.get("restart_policy") or "never"
 
-    kind = "ui-plugin" if has_web_ui else ("cron-automation" if builtin == "schedule" else "daemon")
+    kind = (
+        "ui-plugin"
+        if has_web_ui
+        else ("cron-automation" if builtin == "schedule" else "daemon")
+    )
     cron_utc = ""
     schedule_sgt = ""
     target_summary = ""
@@ -858,12 +1102,13 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
       else:
         target_summary = " ".join(args[1:3])
     else:
-      target_summary = f"{cmd_name} {' '.join(str(a) for a in args[:2])}".strip()
+      target_summary = (
+          f"{cmd_name} {' '.join(str(a) for a in args[:2])}".strip()
+      )
       if not has_web_ui and cmd_name.startswith("python"):
         cron_utc = "Continuous loop"
         schedule_sgt = "Continuous Daemon Loop"
 
-    # Match against live OS processes
     real_sdir = os.path.realpath(sdir)
     matched_proc = None
     for p in procs:
@@ -879,26 +1124,20 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
       elif sdir in pcmd or real_sdir in pcmd:
         matched_proc = p
         break
-      elif args and len(args) == 1 and args[0] != "server.py" and args[0] in pcmd:
+      elif (
+          args
+          and len(args) == 1
+          and args[0] != "server.py"
+          and args[0] in pcmd
+      ):
         matched_proc = p
         break
       elif sid == "jetski-harness/console" and p["pid"] == os.getpid():
         matched_proc = p
         break
 
-    # Inspect any local state tracker JSON (e.g. claimed_posts.json) in the sidecar directory
-    extra_badge = ""
-    claimed_path = os.path.join(sdir, "claimed_posts.json")
-    if os.path.isfile(claimed_path):
-      try:
-        with open(claimed_path, "r", encoding="utf-8") as cf:
-          cdata = json.load(cf)
-          if isinstance(cdata, (list, dict)):
-            extra_badge = f"{len(cdata)} items tracked"
-      except Exception:
-        pass
+    extra_badge = _inspect_sidecar_state_badge(sdir)
 
-    # Dynamically synthesize rich explanation from sidecar.json fields & prompt instructions
     prompt_preview = ""
     mechanism_desc = ""
     safety_desc = ""
@@ -909,7 +1148,7 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
       if subcmd == "send-message" and len(args) >= 4:
         mechanism_desc = (
             f"Scheduled via Jetski's builtin 'schedule' runner ({cron_utc} UTC). "
-            f"Instead of spawning a new session each run, it dispatches `agentapi send-message` "
+            "Instead of spawning a new session each run, it dispatches `agentapi send-message` "
             f"to persistent conversation `{args[3][:8]}…` so all runs stay consolidated in one thread."
         )
       elif subcmd == "new-conversation":
@@ -919,18 +1158,21 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
             "the multi-step workflow autonomously."
         )
       else:
-        mechanism_desc = f"Scheduled via `builtin: schedule` ({cron_utc} UTC) invoking `{target_summary}`."
+        mechanism_desc = (
+            f"Scheduled via `builtin: schedule` ({cron_utc} UTC) invoking `{target_summary}`."
+        )
       safety_desc = (
-          "Controlled by SidecarManager (`restart_policy: "
-          + restart_policy
-          + "`). Can be paused/resumed or triggered on-demand from this dashboard."
+          f"Controlled by SidecarManager (`restart_policy: {restart_policy}`). "
+          "Can be paused/resumed or triggered on-demand from this dashboard."
       )
     elif has_web_ui:
       mechanism_desc = (
           f"Always-on HTTP UI sidecar (`{target_summary}`, `has_web_ui: true`) "
           "mounted into the Jetski auxiliary pane."
       )
-      safety_desc = "Read-only local telemetry inspection and authenticated JSON-RPC bridge."
+      safety_desc = (
+          "Read-only local telemetry inspection and authenticated JSON-RPC bridge."
+      )
     else:
       mechanism_desc = (
           f"Background daemon process (`{target_summary}`) managed by SidecarManager "
@@ -941,10 +1183,11 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
           "and operates in read-only monitoring mode."
       )
 
-    # Check sidecar logs if available
     log_lines = []
     for candidate_id in (sid, sid.replace("/", "_"), sid.split("/")[-1]):
-      log_file = os.path.join(JETSKI_DIR, "sidecar_data", candidate_id, "logs", "sidecar.log")
+      log_file = os.path.join(
+          JETSKI_DIR, "sidecar_data", candidate_id, "logs", "sidecar.log"
+      )
       if os.path.isfile(log_file):
         try:
           with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
@@ -963,7 +1206,14 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
         "restartPolicy": restart_policy,
         "hasWebUi": has_web_ui,
         "cronUtc": cron_utc,
-        "scheduleSgt": schedule_sgt or ("Always-On Web UI Sidecar" if has_web_ui else "Continuous Daemon"),
+        "scheduleSgt": (
+            schedule_sgt
+            or (
+                "Always-On Web UI Sidecar"
+                if has_web_ui
+                else "Continuous Daemon"
+            )
+        ),
         "targetSummary": target_summary,
         "promptPreview": prompt_preview,
         "mechanismDesc": mechanism_desc,
@@ -971,15 +1221,26 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
         "isRunning": matched_proc is not None,
         "pid": matched_proc["pid"] if matched_proc else None,
         "uptimeSeconds": matched_proc["etimes"] if matched_proc else 0,
-        "uptimeFormatted": _format_uptime(matched_proc["etimes"]) if matched_proc else "Stopped",
+        "uptimeFormatted": (
+            _format_uptime(matched_proc["etimes"])
+            if matched_proc
+            else "Stopped"
+        ),
         "extraBadge": extra_badge,
         "recentLogs": log_lines,
-        "canTriggerNow": builtin == "schedule" and len(args) >= 3 and args[1] == "agentapi",
+        "canTriggerNow": (
+            builtin == "schedule" and len(args) >= 3 and args[1] == "agentapi"
+        ),
     })
 
-  # Sort: running first, then cron-automations & daemons before ui-plugins
   kind_order = {"cron-automation": 0, "daemon": 1, "ui-plugin": 2}
-  results.sort(key=lambda r: (0 if r["isRunning"] else 1, kind_order.get(r["kind"], 3), r["id"]))
+  results.sort(
+      key=lambda r: (
+          0 if r["isRunning"] else 1,
+          kind_order.get(r["kind"], 3),
+          r["id"],
+      )
+  )
   _AUTOMATIONS_CACHE.update({"ts": now, "data": results})
   return results
 
@@ -987,10 +1248,13 @@ def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
 def _get_runtime_and_mcp_status(force: bool = False) -> dict:
   """Collects MCP server health, OAuth status, Memory FUSE status, and LS state."""
   now = time.time()
-  if not force and _RUNTIME_STATUS_CACHE["data"] and (now - _RUNTIME_STATUS_CACHE["ts"] < 30.0):
+  if (
+      not force
+      and _RUNTIME_STATUS_CACHE["data"]
+      and (now - _RUNTIME_STATUS_CACHE["ts"] < 30.0)
+  ):
     return _RUNTIME_STATUS_CACHE["data"]
 
-  # 1. OAuth tokens from ~/.gemini/jetski/mcp_oauth_tokens.json
   oauth_path = os.path.join(JETSKI_DIR, "mcp_oauth_tokens.json")
   oauth_map = {}
   if os.path.isfile(oauth_path):
@@ -998,11 +1262,14 @@ def _get_runtime_and_mcp_status(force: bool = False) -> dict:
       with open(oauth_path, "r", encoding="utf-8") as f:
         raw_oauth = json.load(f)
       if isinstance(raw_oauth, dict):
-        oauth_map = raw_oauth.get("tokens") if isinstance(raw_oauth.get("tokens"), dict) else raw_oauth
+        oauth_map = (
+            raw_oauth.get("tokens")
+            if isinstance(raw_oauth.get("tokens"), dict)
+            else raw_oauth
+        )
     except Exception:
       pass
 
-  # 2. MCP servers in ~/.gemini/jetski/mcp/<server>
   mcp_root = os.path.join(JETSKI_DIR, "mcp")
   mcp_servers = []
   if os.path.isdir(mcp_root):
@@ -1015,20 +1282,19 @@ def _get_runtime_and_mcp_status(force: bool = False) -> dict:
           for fn in sorted(os.listdir(sdir))
           if fn.endswith(".json") and fn != "mcp_config.json"
       ]
-      # Match oauth token if any
       short_label = sname.replace("_google_", " · ").replace("_", " ")
-      has_oauth = bool(oauth_map)
       mcp_servers.append({
           "name": sname,
-          "shortName": sname.split("_google_")[-1] if "_google_" in sname else sname,
+          "shortName": (
+              sname.split("_google_")[-1] if "_google_" in sname else sname
+          ),
           "displayName": short_label.title(),
           "toolCount": len(tools),
           "sampleTools": tools[:5],
           "status": "READY" if tools else "EMPTY",
-          "oauthAuthenticated": has_oauth,
+          "oauthAuthenticated": bool(oauth_map),
       })
 
-  # 3. Memory FUSE status
   memory_files = []
   if os.path.isdir(MEMORY_DIR):
     for root, _, files in os.walk(MEMORY_DIR):
@@ -1042,12 +1308,17 @@ def _get_runtime_and_mcp_status(force: bool = False) -> dict:
             mt = 0.0
           memory_files.append({
               "path": rel_p,
-              "updatedAt": datetime.fromtimestamp(mt, tz=SGT_TZ).strftime("%Y-%m-%d %H:%M SGT") if mt else "",
+              "updatedAt": (
+                  datetime.fromtimestamp(mt, tz=SGT_TZ).strftime(
+                      "%Y-%m-%d %H:%M SGT"
+                  )
+                  if mt
+                  else ""
+              ),
               "mtime": mt,
           })
   memory_files.sort(key=lambda x: x["mtime"], reverse=True)
 
-  # 4. Language Server info
   ls_addr, _, ls_pid = _discover_language_server(force=False)
   now_utc = datetime.now(timezone.utc)
   now_sgt = now_utc.astimezone(SGT_TZ)
@@ -1071,7 +1342,9 @@ def _get_runtime_and_mcp_status(force: bool = False) -> dict:
           "timeUtc": now_utc.strftime("%H:%M:%S UTC"),
           "timeSgt": now_sgt.strftime("%Y-%m-%d %H:%M:%S SGT"),
           "sidecarPid": os.getpid(),
-          "sidecarPort": int(os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT", 0)),
+          "sidecarPort": int(
+              os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT", 0)
+          ),
       },
   }
   _RUNTIME_STATUS_CACHE.update({"ts": now, "data": res})
@@ -1119,7 +1392,9 @@ def _synthesize_steps_from_ls_trajectory(conv_id: str) -> list[dict]:
       thinking = pr.get("thinking") or ""
       tcalls = []
       for raw_tc in pr.get("toolCalls") or []:
-        tc = raw_tc.get("toolCall", raw_tc) if isinstance(raw_tc, dict) else {}
+        tc = (
+            raw_tc.get("toolCall", raw_tc) if isinstance(raw_tc, dict) else {}
+        )
         tname = tc.get("name") or "tool"
         args_raw = tc.get("argumentsJson") or tc.get("arguments") or {}
         if isinstance(args_raw, str):
@@ -1146,33 +1421,28 @@ def _synthesize_steps_from_ls_trajectory(conv_id: str) -> list[dict]:
 
 
 def _read_transcript_steps(conv_id: str, since: int = -1) -> list[dict]:
-  tpath = _get_transcript_path(conv_id, full=False)
-  steps = []
-  if tpath and os.path.isfile(tpath):
-    try:
-      with open(tpath, "r", encoding="utf-8", errors="replace") as f:
-        for raw in f:
-          line = raw.strip()
-          if not line:
-            continue
-          try:
-            step = json.loads(line)
-            if step.get("step_index", -1) > since:
-              steps.append(step)
-          except json.JSONDecodeError:
-            continue
-    except OSError:
-      pass
-  if not steps and since <= -1:
-    steps = [
+  """Reads parsed transcript steps from the shared incremental step cache."""
+  bundle = _get_cached_transcript_bundle(conv_id)
+  steps = bundle["steps"]
+  if steps:
+    if since < 0:
+      return steps
+    return [s for s in steps if s.get("step_index", -1) > since]
+  if since <= -1:
+    return [
         s
         for s in _synthesize_steps_from_ls_trajectory(conv_id)
         if s.get("step_index", -1) > since
     ]
-  return steps
+  return []
 
 
 def _read_step_full(conv_id: str, step_idx: int) -> dict | None:
+  cache_key = (conv_id, step_idx)
+  cached_step = _lru_get(_FULL_STEP_CONTENT_CACHE, cache_key)
+  if cached_step is not None:
+    return cached_step
+
   for full_flag in (True, False):
     tpath = _get_transcript_path(conv_id, full=full_flag)
     if not tpath or not os.path.isfile(tpath):
@@ -1186,6 +1456,8 @@ def _read_step_full(conv_id: str, step_idx: int) -> dict | None:
           try:
             step = json.loads(line)
             if step.get("step_index") == step_idx:
+              if step.get("status") == "DONE":
+                _lru_set(_FULL_STEP_CONTENT_CACHE, cache_key, step, max_size=256)
               return step
           except json.JSONDecodeError:
             continue
@@ -1194,14 +1466,56 @@ def _read_step_full(conv_id: str, step_idx: int) -> dict | None:
   return None
 
 
+def _get_subagents_live_status(sub_ids: list[str]) -> dict:
+  """Returns live status for child subagent conversations requested by embedded /tracer."""
+  out = {}
+  for cid in sub_ids[:25]:
+    if not cid or not _UUID_RE.match(cid):
+      continue
+    tmeta = _summarize_transcript_fast(cid)
+    if not tmeta.get("exists"):
+      out[cid] = {"exists": False, "state": "unknown"}
+      continue
+    status = tmeta.get("status", "IDLE")
+    state_label = (
+        "running"
+        if status == "RUNNING"
+        else ("errored" if status == "ERROR" else "completed")
+    )
+    out[cid] = {
+        "exists": True,
+        "state": state_label,
+        "steps": tmeta.get("stepCount", 0),
+        "tool_calls": tmeta.get("toolCallCount", 0),
+        "last_tool": tmeta.get("lastAction") or "",
+        "age_seconds": round(
+            max(0.0, time.time() - (tmeta.get("mtime") or time.time())), 1
+        ),
+    }
+  return out
+
+
 def _check_tracer_git_update(force: bool = False) -> dict:
   now = time.time()
-  if not force and _UPDATE_CACHE["data"] and (now - _UPDATE_CACHE["ts"] < _UPDATE_TTL):
+  if (
+      not force
+      and _UPDATE_CACHE["data"]
+      and (now - _UPDATE_CACHE["ts"] < _UPDATE_TTL)
+  ):
     return _UPDATE_CACHE["data"]
   try:
-    subprocess.run(["git", "-C", TRACER_DIR, "fetch", "--quiet"], timeout=10, check=True, capture_output=True)
-    local = subprocess.check_output(["git", "-C", TRACER_DIR, "rev-parse", "HEAD"], text=True, timeout=5).strip()
-    remote = subprocess.check_output(["git", "-C", TRACER_DIR, "rev-parse", "@{u}"], text=True, timeout=5).strip()
+    subprocess.run(
+        ["git", "-C", TRACER_DIR, "fetch", "--quiet"],
+        timeout=10,
+        check=True,
+        capture_output=True,
+    )
+    local = subprocess.check_output(
+        ["git", "-C", TRACER_DIR, "rev-parse", "HEAD"], text=True, timeout=5
+    ).strip()
+    remote = subprocess.check_output(
+        ["git", "-C", TRACER_DIR, "rev-parse", "@{u}"], text=True, timeout=5
+    ).strip()
     behind = int(
         subprocess.check_output(
             ["git", "-C", TRACER_DIR, "rev-list", "--count", "HEAD..@{u}"],
@@ -1221,20 +1535,25 @@ def _check_tracer_git_update(force: bool = False) -> dict:
         "commits": [],
     }
   except Exception as e:
-    result = {"supported": False, "update_available": False, "behind": 0, "error": str(e)}
+    result = {
+        "supported": False,
+        "update_available": False,
+        "behind": 0,
+        "error": str(e),
+    }
   _UPDATE_CACHE["data"] = result
   _UPDATE_CACHE["ts"] = now
   return result
 
 
 def _render_embedded_tracer_html(conv_id: str) -> bytes:
-  """Loads the user's Agent Tracer index.html and injects conversation-sync, compact-mode Architecture support & step-focus bridge."""
+  """Loads Agent Tracer index.html from memory cache and injects conversation-sync & compact-mode bridge."""
   tracer_html_path = os.path.join(TRACER_DIR, "index.html")
-  if not os.path.isfile(tracer_html_path):
+  raw_bytes = _read_cached_file_bytes(tracer_html_path)
+  if raw_bytes is None:
     return b"<html><body style='background:#0d1117;color:#e6edf3;font-family:sans-serif;padding:24px'>Agent Tracer index.html not found.</body></html>"
 
-  with open(tracer_html_path, "r", encoding="utf-8", errors="replace") as f:
-    html = f.read()
+  html = raw_bytes.decode("utf-8", errors="replace")
 
   bridge_script = f"""
 <style>
@@ -1255,7 +1574,6 @@ def _render_embedded_tracer_html(conv_id: str) -> bytes:
     font-size: 10.5px !important;
     padding: 3px 7px !important;
   }}
-  /* Keep Architecture (Topology) HUD ultra-compact on 1 single line so the SVG diagram gets 90%+ height */
   html.harness-compact-embed .topo-hud {{
     flex-wrap: nowrap !important;
     padding: 3px 8px !important;
@@ -1325,8 +1643,6 @@ def _render_embedded_tracer_html(conv_id: str) -> bytes:
         const btn = document.getElementById(btnId);
         if (btn) btn.click();
       }} else if (ev.data.type === 'HARNESS_FOCUS_STEP' && ev.data.stepIndex != null) {{
-        const sIdx = ev.data.stepIndex;
-        const tIdx = ev.data.toolIndex != null ? ev.data.toolIndex : 0;
         const timelineBtn = document.getElementById('btnViewTimeline');
         if (timelineBtn && document.body.classList.contains('topology-mode')) {{
           timelineBtn.click();
@@ -1374,15 +1690,15 @@ def _render_embedded_tracer_html(conv_id: str) -> bytes:
 
 # --- Structured Chat Stream & Direct Connect-RPC Dispatch ---
 
-_CHAT_STREAM_CACHE = {}  # conv_id -> (mtime, dict)
-
 
 def _clean_user_input(raw_content: str) -> tuple[str, str]:
   """Extracts clean user prompt and optional system notice from USER_INPUT step."""
   if not raw_content:
     return "", ""
   sys_notice = ""
-  sm = re.search(r"<SYSTEM_MESSAGE>(.*?)</SYSTEM_MESSAGE>", raw_content, re.DOTALL)
+  sm = re.search(
+      r"<SYSTEM_MESSAGE>(.*?)</SYSTEM_MESSAGE>", raw_content, re.DOTALL
+  )
   if sm:
     sys_notice = sm.group(1).strip()
 
@@ -1390,9 +1706,18 @@ def _clean_user_input(raw_content: str) -> tuple[str, str]:
   if um:
     return um.group(1).strip(), sys_notice
 
-  cleaned = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", "", raw_content, flags=re.DOTALL)
-  cleaned = re.sub(r"<SYSTEM_MESSAGE>.*?</SYSTEM_MESSAGE>", "", cleaned, flags=re.DOTALL)
-  cleaned = re.sub(r"<CONTEXT_SUMMARY>.*?</CONTEXT_SUMMARY>", "", cleaned, flags=re.DOTALL)
+  cleaned = re.sub(
+      r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>",
+      "",
+      raw_content,
+      flags=re.DOTALL,
+  )
+  cleaned = re.sub(
+      r"<SYSTEM_MESSAGE>.*?</SYSTEM_MESSAGE>", "", cleaned, flags=re.DOTALL
+  )
+  cleaned = re.sub(
+      r"<CONTEXT_SUMMARY>.*?</CONTEXT_SUMMARY>", "", cleaned, flags=re.DOTALL
+  )
   return cleaned.strip(), sys_notice
 
 
@@ -1404,14 +1729,18 @@ def _summarize_thinking_line(thinking: str) -> str:
   if not lines:
     return ""
   first = re.sub(r"^[\*\#\-\s]+|[\*\#\s]+$", "", lines[0]).strip()
-  if len(lines) > 1 and len(first) < 55 and not first.endswith((".", "!", "?", ":")):
+  if (
+      len(lines) > 1
+      and len(first) < 55
+      and not first.endswith((".", "!", "?", ":"))
+  ):
     second = re.sub(r"^[\*\#\-\s]+", "", lines[1]).strip()
     combined = f"{first} — {second}"
     return combined[:110] + ("…" if len(combined) > 110 else "")
   return first[:110] + ("…" if len(first) > 110 else "")
 
 
-def _parse_tool_result_step(res_step: dict, tool_name: str) -> dict:
+def _parse_tool_result_step(res_step: dict) -> dict:
   """Parses a paired GENERIC tool result step for duration, status, and body."""
   raw = res_step.get("content") or ""
   status = res_step.get("status") or "DONE"
@@ -1443,10 +1772,11 @@ def _parse_tool_result_step(res_step: dict, tool_name: str) -> dict:
     except Exception:
       pass
 
-  # Accurate error detection (check header before Output: for run_command)
   is_error = status == "ERROR"
   if not is_error:
-    header_part = body.split("Output:", 1)[0] if "Output:" in body else body[:400]
+    header_part = (
+        body.split("Output:", 1)[0] if "Output:" in body else body[:400]
+    )
     if re.search(r"The command exited with code [1-9]\d*", header_part):
       is_error = True
     elif body.startswith("Encountered error in tool execution:"):
@@ -1456,8 +1786,8 @@ def _parse_tool_result_step(res_step: dict, tool_name: str) -> dict:
       "resultStepIndex": res_step.get("step_index"),
       "status": "ERROR" if is_error else status,
       "durationMs": duration_ms,
-      "outputPreview": body[:2400],
-      "isTruncated": len(body) > 2400 or bool(res_step.get("truncated_fields")),
+      "outputPreview": body[:1200],
+      "isTruncated": len(body) > 1200 or bool(res_step.get("truncated_fields")),
   }
 
 
@@ -1489,7 +1819,10 @@ def _extract_tool_target(name: str, args: dict) -> str:
     cmd = _clean_arg_value(str(args["CommandLine"])).splitlines()[0]
     return cmd[:72] + ("…" if len(cmd) > 72 else "")
   if name == "call_mcp_tool":
-    return f"{_clean_arg_value(args.get('ServerName', ''))} · {_clean_arg_value(args.get('ToolName', ''))}".strip(" ·")
+    return (
+        f"{_clean_arg_value(args.get('ServerName', ''))} ·"
+        f" {_clean_arg_value(args.get('ToolName', ''))}".strip(" ·")
+    )
   if name == "invoke_subagent":
     subs = args.get("Subagents") or []
     if subs and isinstance(subs, list) and isinstance(subs[0], dict):
@@ -1501,17 +1834,14 @@ def _build_chat_stream(conv_id: str) -> dict:
   """Builds structured chat messages + paired tool calls + subagents feed for the primary Chat UI."""
   if not conv_id:
     return {"conversationId": "", "items": [], "subagents": [], "stepCount": 0}
-  tpath = _get_transcript_path(conv_id, full=False)
-  mtime = 0.0
-  if tpath and os.path.isfile(tpath):
-    try:
-      mtime = os.path.getmtime(tpath)
-    except OSError:
-      mtime = 0.0
 
-  cached = _CHAT_STREAM_CACHE.get(conv_id)
-  if cached and mtime > 0 and cached[0] == mtime:
-    return cached[1]
+  bundle = _get_cached_transcript_bundle(conv_id)
+  mtime_ns = bundle["mtime_ns"]
+  fsize = bundle["size"]
+
+  cached = _lru_get(_CHAT_STREAM_CACHE, conv_id)
+  if cached and mtime_ns > 0 and cached[0] == mtime_ns and cached[1] == fsize:
+    return cached[2]
 
   steps = _read_transcript_steps(conv_id, since=-1)
   tok_info = _get_token_telemetry(conv_id, include_generations=True)
@@ -1535,6 +1865,7 @@ def _build_chat_stream(conv_id: str) -> dict:
       if user_text or sys_notice:
         items.append({
             "kind": "user",
+            "role": "user",
             "stepIndex": sidx,
             "lastStepIndex": sidx,
             "createdAt": created,
@@ -1554,7 +1885,6 @@ def _build_chat_stream(conv_id: str) -> dict:
       content = (st.get("content") or "").strip()
       raw_tcalls = st.get("tool_calls") or []
 
-      # Pair with immediately following GENERIC steps (source=MODEL)
       paired_tools = []
       j = i + 1
       for tc in raw_tcalls:
@@ -1565,7 +1895,11 @@ def _build_chat_stream(conv_id: str) -> dict:
             targs = json.loads(targs)
           except Exception:
             targs = {"raw": targs}
-        targs = _clean_arg_value(targs) if isinstance(targs, dict) else {"raw": str(targs)}
+        targs = (
+            _clean_arg_value(targs)
+            if isinstance(targs, dict)
+            else {"raw": str(targs)}
+        )
         action_label = (
             (targs.get("toolAction") if isinstance(targs, dict) else None)
             or (targs.get("toolSummary") if isinstance(targs, dict) else None)
@@ -1581,7 +1915,7 @@ def _build_chat_stream(conv_id: str) -> dict:
             "isTruncated": False,
         }
         if j < n and steps[j].get("type") == "GENERIC":
-          res_meta = _parse_tool_result_step(steps[j], tname)
+          res_meta = _parse_tool_result_step(steps[j])
           j += 1
 
         if tname == "invoke_subagent" and isinstance(targs, dict):
@@ -1589,7 +1923,11 @@ def _build_chat_stream(conv_id: str) -> dict:
             if isinstance(sub_entry, dict):
               subagents.append({
                   "stepIndex": sidx,
-                  "role": sub_entry.get("Role") or sub_entry.get("TypeName") or "Subagent",
+                  "role": (
+                      sub_entry.get("Role")
+                      or sub_entry.get("TypeName")
+                      or "Subagent"
+                  ),
                   "typeName": sub_entry.get("TypeName") or "self",
                   "promptPreview": (sub_entry.get("Prompt") or "")[:140],
                   "status": res_meta["status"],
@@ -1597,13 +1935,23 @@ def _build_chat_stream(conv_id: str) -> dict:
                   "createdAt": created,
               })
 
+        try:
+          args_preview = (
+              json.dumps(targs, indent=2)
+              if isinstance(targs, dict)
+              else str(targs)
+          )[:600]
+        except Exception:
+          args_preview = str(targs)[:600]
+
         paired_tools.append({
             "id": tc.get("id") or f"tc_{sidx}_{len(paired_tools)}",
             "stepIndex": sidx,
             "name": tname,
             "action": action_label,
             "target": target_hint,
-            "args": targs,
+            "summary": action_label or target_hint or "",
+            "argsPreview": args_preview,
             **res_meta,
         })
 
@@ -1612,7 +1960,9 @@ def _build_chat_stream(conv_id: str) -> dict:
         lt = paired_tools[-1]
         latest_tool_desc = (
             f"{lt['action']} ({lt['target']})"
-            if lt.get("target") and lt.get("action") and lt["target"] not in lt["action"]
+            if lt.get("target")
+            and lt.get("action")
+            and lt["target"] not in lt["action"]
             else (lt.get("action") or lt.get("target") or lt["name"])
         )
 
@@ -1623,11 +1973,12 @@ def _build_chat_stream(conv_id: str) -> dict:
         prev["updatedAt"] = created
         prev["status"] = st.get("status") or prev["status"]
         if thinking:
-          prev["thinking"] = (
+          combined_thinking = (
               f"{prev['thinking']}\n\n---\n\n{thinking}"
               if prev.get("thinking")
               else thinking
           )
+          prev["thinking"] = combined_thinking[-3600:]
           prev["thinkingSummary"] = _summarize_thinking_line(thinking)
         if latest_tool_desc:
           prev["latestAction"] = latest_tool_desc
@@ -1652,14 +2003,17 @@ def _build_chat_stream(conv_id: str) -> dict:
       else:
         items.append({
             "kind": "assistant",
+            "role": "agent",
             "stepIndex": sidx,
             "lastStepIndex": sidx,
             "createdAt": created,
             "updatedAt": created,
             "status": st.get("status") or "DONE",
-            "thinking": thinking,
+            "thinking": thinking[-3600:],
             "thinkingSummary": _summarize_thinking_line(thinking),
-            "latestAction": latest_tool_desc or _summarize_thinking_line(thinking),
+            "latestAction": (
+                latest_tool_desc or _summarize_thinking_line(thinking)
+            ),
             "thinkingTruncated": "thinking" in trunc_fields,
             "content": content,
             "toolCalls": paired_tools,
@@ -1678,20 +2032,22 @@ def _build_chat_stream(conv_id: str) -> dict:
         continue
       items.append({
           "kind": "error",
+          "role": "agent",
           "stepIndex": sidx,
           "lastStepIndex": sidx,
           "createdAt": created,
           "content": err_content,
+          "toolCalls": [],
       })
     i += 1
 
   result = {
       "conversationId": conv_id,
       "stepCount": len(steps),
-      "items": items[-120:],  # Keep payload snappy while showing full recent history
+      "items": items[-120:],
       "subagents": subagents[-20:],
   }
-  _CHAT_STREAM_CACHE[conv_id] = (mtime, result)
+  _lru_set(_CHAT_STREAM_CACHE, conv_id, (mtime_ns, fsize, result))
   return result
 
 
@@ -1707,7 +2063,9 @@ def _run_agentapi(args: list[str], project_id: str | None = None) -> dict:
       timeout=25,
   )
   if res.returncode != 0:
-    raise RuntimeError(res.stderr.strip() or f"agentapi exited with {res.returncode}")
+    raise RuntimeError(
+        res.stderr.strip() or f"agentapi exited with {res.returncode}"
+    )
   out = res.stdout.strip()
   try:
     return json.loads(out) if out else {"ok": True}
@@ -1717,14 +2075,15 @@ def _run_agentapi(args: list[str], project_id: str | None = None) -> dict:
 
 def _resolve_plan_model(conv_id: str = "", model_tier: str = "pro") -> str:
   """Resolves a valid planModel enum for SendUserCascadeMessage / StartCascade."""
-  # 1. If sending to an existing conversation, preserve its current model from cache or trajectory
   if conv_id:
-    cached = _TOKEN_USAGE_CACHE.get(conv_id)
+    cached = _lru_get(_TOKEN_USAGE_CACHE, conv_id)
     if cached and isinstance(cached[2], dict):
       m = cached[2].get("rawModel") or cached[2].get("model") or ""
       if m.startswith("MODEL_"):
         return m
-    traj_resp = _call_ls("GetCascadeTrajectory", {"cascade_id": conv_id}, timeout=2.0)
+    traj_resp = _call_ls(
+        "GetCascadeTrajectory", {"cascade_id": conv_id}, timeout=2.0
+    )
     if traj_resp and isinstance(traj_resp.get("trajectory"), dict):
       gen_meta = traj_resp["trajectory"].get("generatorMetadata") or []
       for gm in reversed(gen_meta):
@@ -1734,7 +2093,6 @@ def _resolve_plan_model(conv_id: str = "", model_tier: str = "pro") -> str:
         if m.startswith("MODEL_"):
           return m
 
-  # 2. Check GetCascadeModelConfigData defaultOverrideModelConfig
   cfg_resp = _call_ls("GetCascadeModelConfigData", {}, timeout=2.0)
   if cfg_resp and isinstance(cfg_resp, dict):
     m = (
@@ -1746,14 +2104,22 @@ def _resolve_plan_model(conv_id: str = "", model_tier: str = "pro") -> str:
     if m.startswith("MODEL_"):
       return m
 
-  # 3. Check GetAvailableModels
   models_resp = _call_ls("GetAvailableModels", {}, timeout=2.5)
   if models_resp and isinstance(models_resp.get("response"), dict):
     rm = models_resp["response"]
     tiered = rm.get("tieredModelIds") or {}
     models_map = rm.get("models") or {}
-    tier_key = "pro" if model_tier == "pro" else ("flashLite" if model_tier == "flash_lite" else "flash")
-    tier_list = tiered.get(tier_key) or tiered.get("pro") or tiered.get("flash") or []
+    tier_key = (
+        "pro"
+        if model_tier == "pro"
+        else ("flashLite" if model_tier == "flash_lite" else "flash")
+    )
+    tier_list = (
+        tiered.get(tier_key)
+        or tiered.get("pro")
+        or tiered.get("flash")
+        or []
+    )
     if tier_list:
       mid = tier_list[0]
       m_info = models_map.get(mid) or {}
@@ -1761,11 +2127,15 @@ def _resolve_plan_model(conv_id: str = "", model_tier: str = "pro") -> str:
       if m.startswith("MODEL_"):
         return m
 
-  # 4. Guaranteed fallback to the default Gemini Pro model enum
   return "MODEL_PLACEHOLDER_M37"
 
 
-def _send_message_direct(conv_id: str, message: str, title: str = "", project_id: str | None = None) -> dict:
+def _send_message_direct(
+    conv_id: str,
+    message: str,
+    title: str = "",
+    project_id: str | None = None,
+) -> dict:
   """Sends a user message to conv_id via Language Server Connect-RPC with automatic model resolution."""
   resolved_model = _resolve_plan_model(conv_id=conv_id)
   rpc_req = {
@@ -1784,9 +2154,14 @@ def _send_message_direct(conv_id: str, message: str, title: str = "", project_id
   }
   resp = _call_ls("SendUserCascadeMessage", rpc_req, timeout=4.0)
   if resp is not None:
-    return {"ok": True, "method": "SendUserCascadeMessage", "conversationId": conv_id, "model": resolved_model, "response": resp}
+    return {
+        "ok": True,
+        "method": "SendUserCascadeMessage",
+        "conversationId": conv_id,
+        "model": resolved_model,
+        "response": resp,
+    }
 
-  # 2. Try SendAgentMessage on the Language Server
   agent_msg_req = {
       "recipient": conv_id,
       "content": message,
@@ -1795,9 +2170,13 @@ def _send_message_direct(conv_id: str, message: str, title: str = "", project_id
     agent_msg_req["displayTitle"] = title
   resp2 = _call_ls("SendAgentMessage", agent_msg_req, timeout=4.0)
   if resp2 is not None:
-    return {"ok": True, "method": "SendAgentMessage", "conversationId": conv_id, "response": resp2}
+    return {
+        "ok": True,
+        "method": "SendAgentMessage",
+        "conversationId": conv_id,
+        "response": resp2,
+    }
 
-  # 3. Fallback to agentapi CLI if on PATH
   args = ["send-message"]
   if title:
     args.extend(["--title", title])
@@ -1805,7 +2184,12 @@ def _send_message_direct(conv_id: str, message: str, title: str = "", project_id
   return _run_agentapi(args, project_id=project_id)
 
 
-def _start_conversation_direct(message: str, title: str = "", model_tier: str = "pro", project_id: str | None = None) -> dict:
+def _start_conversation_direct(
+    message: str,
+    title: str = "",
+    model_tier: str = "pro",
+    project_id: str | None = None,
+) -> dict:
   """Starts a new conversation via Language Server Connect-RPC (StartCascade + SendUserCascadeMessage)."""
   resolved_model = _resolve_plan_model(conv_id="", model_tier=model_tier)
 
@@ -1826,7 +2210,9 @@ def _start_conversation_direct(message: str, title: str = "", model_tier: str = 
           },
       },
       "projectEnvConfig": {
-          "projectId": project_id or os.environ.get("ANTIGRAVITY_PROJECT_ID", ""),
+          "projectId": (
+              project_id or os.environ.get("ANTIGRAVITY_PROJECT_ID", "")
+          ),
           "defaultProjectEnvironment": {},
       },
   }
@@ -1862,14 +2248,61 @@ def _start_conversation_direct(message: str, title: str = "", model_tier: str = 
         },
         timeout=4.0,
     )
-    return {"ok": True, "conversationId": cid, "model": resolved_model, "method": "StartCascade"}
+    return {
+        "ok": True,
+        "conversationId": cid,
+        "model": resolved_model,
+        "method": "StartCascade",
+    }
 
-  # Fallback to agentapi CLI
   args = ["new-conversation"]
   if title:
     args.extend(["--title", title])
   args.extend(["--", message])
   return _run_agentapi(args, project_id=project_id)
+
+
+def _trigger_automation_by_id(sidecar_id: str) -> tuple[dict, int]:
+  """Triggers a scheduled sidecar automation immediately via Connect-RPC."""
+  if not sidecar_id or "/" in sidecar_id or ".." in sidecar_id:
+    return {"ok": False, "error": "Invalid automation ID"}, 400
+  sjson_path = os.path.join(CONFIG_DIR, "sidecars", sidecar_id, "sidecar.json")
+  if not os.path.isfile(sjson_path):
+    return {"ok": False, "error": f"Automation {sidecar_id} not found"}, 404
+  try:
+    with open(sjson_path, "r", encoding="utf-8") as f:
+      cfg = json.load(f)
+    args = cfg.get("args") or []
+    if len(args) >= 5 and args[1] == "agentapi" and args[2] == "send-message":
+      return _send_message_direct(args[3], args[4]), 200
+    if (
+        len(args) >= 4
+        and args[1] == "agentapi"
+        and args[2] == "new-conversation"
+    ):
+      return _start_conversation_direct(args[-1], title=sidecar_id), 200
+    return {"ok": False, "error": "Unsupported automation command shape"}, 400
+  except Exception as e:
+    return {"ok": False, "error": str(e)}, 500
+
+
+def _resolve_request_conv_id(params: dict | None = None, body: dict | None = None) -> str:
+  """Resolves conversation ID from query params, POST body, or sidecar environment."""
+  if params:
+    for key in ("convId", "conversationId", "conv_id"):
+      val = (params.get(key) or [None])[0]
+      if val:
+        return val.strip()
+  if body:
+    for key in ("convId", "conversationId", "conv_id"):
+      val = body.get(key)
+      if isinstance(val, str) and val.strip():
+        return val.strip()
+  return (
+      os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
+      or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+      or ""
+  ).strip()
 
 
 class HarnessRequestHandler(BaseHTTPRequestHandler):
@@ -1888,16 +2321,16 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
     self.wfile.write(body)
 
   def _send_json(self, data: dict | list, status: int = 200):
-    body = json.dumps(data).encode("utf-8")
+    body = json.dumps(data, separators=(",", ":")).encode("utf-8")
     self._send_bytes(body, "application/json; charset=utf-8", status=status)
 
   def _serve_static(self, filename: str, content_type: str):
     fpath = os.path.join(BASE_DIR, filename)
-    if not os.path.isfile(fpath):
+    body = _read_cached_file_bytes(fpath)
+    if body is None:
       self._send_json({"error": f"{filename} not found"}, status=404)
       return
-    with open(fpath, "rb") as f:
-      self._send_bytes(f.read(), content_type)
+    self._send_bytes(body, content_type)
 
   def do_GET(self):
     parsed = urllib.parse.urlparse(self.path)
@@ -1914,33 +2347,27 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
       self._serve_static("app.js", "application/javascript; charset=utf-8")
       return
     if path == "/preload.js":
-      if os.path.isfile(PRELOAD_SDK_PATH):
-        with open(PRELOAD_SDK_PATH, "rb") as f:
-          self._send_bytes(f.read(), "application/javascript; charset=utf-8")
+      body = _read_cached_file_bytes(PRELOAD_SDK_PATH)
+      if body is not None:
+        self._send_bytes(body, "application/javascript; charset=utf-8")
       else:
-        self._send_bytes(b"window.sidecar = window.sidecar || {};", "application/javascript; charset=utf-8")
+        self._send_bytes(
+            b"window.sidecar = window.sidecar || {};",
+            "application/javascript; charset=utf-8",
+        )
       return
 
     # Embedded Agent Tracer view
     if path == "/tracer":
-      conv_id = (
-          params.get("convId", [None])[0]
-          or params.get("conversationId", [None])[0]
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-          or ""
+      conv_id = _resolve_request_conv_id(params=params)
+      self._send_bytes(
+          _render_embedded_tracer_html(conv_id), "text/html; charset=utf-8"
       )
-      self._send_bytes(_render_embedded_tracer_html(conv_id), "text/html; charset=utf-8")
       return
 
-    # Agent Tracer API endpoints (matching agent-tracer's exact JSON shapes)
+    # Embedded Agent Tracer API endpoints
     if path == "/api/transcript":
-      conv_id = (
-          params.get("convId", [None])[0]
-          or params.get("conversationId", [None])[0]
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-      )
+      conv_id = _resolve_request_conv_id(params=params)
       if not conv_id:
         self._send_json([])
         return
@@ -1948,23 +2375,49 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         since = int(params.get("since", ["-1"])[0])
       except ValueError:
         since = -1
-      steps = _read_transcript_steps(conv_id, since=since)
-      self._send_json(steps)
+      self._send_json(_read_transcript_steps(conv_id, since=since))
       return
 
     if path == "/api/step_full":
-      conv_id = (
-          params.get("convId", [None])[0]
-          or params.get("conversationId", [None])[0]
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-      )
+      conv_id = _resolve_request_conv_id(params=params)
       step_idx = params.get("step", [None])[0]
       if not conv_id or step_idx is None:
         self._send_json({}, status=400)
         return
-      step = _read_step_full(conv_id, int(step_idx))
+      try:
+        step = _read_step_full(conv_id, int(step_idx))
+      except ValueError:
+        step = None
       self._send_json(step if step else {})
+      return
+
+    if path == "/api/subagents_status":
+      raw_ids = params.get("ids", [""])[0]
+      sub_ids = [x.strip() for x in raw_ids.split(",") if x.strip()]
+      self._send_json(_get_subagents_live_status(sub_ids))
+      return
+
+    if path == "/api/telemetry":
+      conv_id = _resolve_request_conv_id(params=params)
+      if not conv_id:
+        self._send_json({"available": False, "reason": "No conversationId"})
+        return
+      tok = _get_token_telemetry(conv_id, include_generations=True)
+      self._send_json({
+          "available": True,
+          "conversationId": conv_id,
+          "status": tok.get("lsStatus") or "IDLE",
+          "model": tok.get("model") or "Gemini Next",
+          "llmCalls": tok.get("llmCalls", 0),
+          "totalInputTokens": tok.get("inputTokens", 0),
+          "totalOutputTokens": tok.get("outputTokens", 0),
+          "totalThinkingTokens": tok.get("thinkingTokens", 0),
+          "totalCacheReadTokens": tok.get("cacheReadTokens", 0),
+          "totalTokens": tok.get("totalTokens", 0),
+          "cacheHitPct": tok.get("cacheHitRatePct", 0.0),
+          "estCostUsd": tok.get("estimatedCostUsd", 0.0),
+          "turns": tok.get("generations") or [],
+      })
       return
 
     if path == "/api/update-status":
@@ -1973,12 +2426,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
       return
 
     if path == "/api/conversations":
-      host_cid = (
-          params.get("conversationId", [None])[0]
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-          or ""
-      )
+      host_cid = _resolve_request_conv_id(params=params)
       convs, _ = _list_conversations(host_cid)
       self._send_json({
           "conversations": convs,
@@ -1988,14 +2436,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
 
     # Structured Chat Stream API for the Primary Chat Canvas
     if path in ("/api/harness/chat", "/api/chat_stream"):
-      conv_id = (
-          params.get("convId", [None])[0]
-          or params.get("conversationId", [None])[0]
-          or params.get("conv_id", [None])[0]
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-          or ""
-      )
+      conv_id = _resolve_request_conv_id(params=params)
       if not conv_id:
         self._send_json({"conversationId": "", "items": [], "stepCount": 0})
         return
@@ -2009,13 +2450,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
           or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
           or ""
       )
-      req_conv = (
-          params.get("convId", [None])[0]
-          or params.get("conversationId", [None])[0]
-          or params.get("conv_id", [None])[0]
-          or host_conv_id
-          or ""
-      )
+      req_conv = _resolve_request_conv_id(params=params)
       conversations, global_tokens = _list_conversations(req_conv)
       active_conv_id = req_conv
       if not active_conv_id and conversations:
@@ -2040,43 +2475,32 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
       all_services = _list_automations_and_sidecars()
       runtime = _get_runtime_and_mcp_status()
 
-      # Normalize chat items for app.js (supporting both role and kind)
-      normalized_chat_items = []
-      for it in chat_stream.get("items") or []:
-        kind = it.get("kind") or "assistant"
-        role = "user" if kind == "user" else "agent"
-        norm_tools = []
-        for tc in it.get("toolCalls") or []:
-          args_obj = tc.get("args") or {}
-          try:
-            args_preview = json.dumps(args_obj, indent=2) if isinstance(args_obj, dict) else str(args_obj)
-          except Exception:
-            args_preview = str(args_obj)
-          norm_tools.append({
-              **tc,
-              "name": tc.get("name") or "tool",
-              "summary": tc.get("action") or tc.get("target") or "",
-              "argsPreview": args_preview[:800],
-          })
-        normalized_chat_items.append({
-            **it,
-            "role": role,
-            "toolCalls": norm_tools,
-        })
-
-      # Split all_services into cron automations vs sidecars for app.js
       cron_items = []
       sidecar_items = []
       for svc in all_services:
-        if svc.get("kind") in ("cron-automation", "daemon") and not svc.get("hasWebUi"):
-          is_paused = svc.get("restartPolicy") == "never" and not svc.get("isRunning")
+        if svc.get("kind") in ("cron-automation", "daemon") and not svc.get(
+            "hasWebUi"
+        ):
+          is_paused = svc.get("restartPolicy") == "never" and not svc.get(
+              "isRunning"
+          )
           cron_items.append({
               **svc,
               "plugin": svc.get("id", ""),
               "name": svc.get("displayName") or svc.get("id", ""),
-              "cron": svc.get("scheduleSgt") or svc.get("cronUtc") or "Continuous",
-              "status": "PAUSED" if is_paused else ("ACTIVE" if svc.get("isRunning") else "STOPPED"),
-              "lastFired": (svc.get("recentLogs") or [""])[-1][:60] if svc.get("recentLogs") else "Scheduled",
+              "cron": (
+                  svc.get("scheduleSgt") or svc.get("cronUtc") or "Continuous"
+              ),
+              "status": (
+                  "PAUSED"
+                  if is_paused
+                  else ("ACTIVE" if svc.get("isRunning") else "STOPPED")
+              ),
+              "lastFired": (
+                  (svc.get("recentLogs") or [""])[-1][:60]
+                  if svc.get("recentLogs")
+                  else "Scheduled"
+              ),
               "canTogglePause": svc.get("sourceType") == "user-sidecar",
           })
         else:
@@ -2102,7 +2526,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
       )
 
       self._send_json({
-          # v2 structured fields consumed by app.js
+          "activeConversationId": active_conv_id,
           "languageServer": runtime.get("languageServer") or {},
           "conversations": {
               "activeId": active_conv_id,
@@ -2118,7 +2542,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
               ),
               "subagentCount": active_subagents,
               "subagents": subagents_list,
-              "items": normalized_chat_items,
+              "items": chat_stream.get("items") or [],
           },
           "tokens": {
               "activeSession": {
@@ -2135,11 +2559,15 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
               },
           },
           "automations": {
-              "activeCount": sum(1 for x in cron_items if x["status"] == "ACTIVE"),
+              "activeCount": sum(
+                  1 for x in cron_items if x["status"] == "ACTIVE"
+              ),
               "items": cron_items,
           },
           "sidecars": {
-              "activeCount": sum(1 for x in sidecar_items if x["status"] == "RUNNING"),
+              "activeCount": sum(
+                  1 for x in sidecar_items if x["status"] == "RUNNING"
+              ),
               "items": sidecar_items,
           },
           "mcp": {
@@ -2151,13 +2579,6 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
           "memories": {
               "items": runtime.get("recentMemories") or [],
           },
-          # Backwards-compatible v1 fields
-          "activeConversationId": active_conv_id,
-          "tokenUsage": token_telemetry,
-          "globalTokens": global_tokens,
-          "globalSummary": global_tokens,
-          "activeChatStream": chat_stream,
-          "runtime": runtime,
       })
       return
 
@@ -2175,13 +2596,25 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
       self._send_json({"error": f"Invalid JSON: {e}"}, status=400)
       return
 
-    # v2 POST /api/chat/send
-    if path == "/api/chat/send":
+    # Unified prompt dispatch (/api/chat/send, /_sidecar/send-message, /_sidecar/new-conversation)
+    if path in (
+        "/api/chat/send",
+        "/_sidecar/send-message",
+        "/api/harness/send-message",
+        "/_sidecar/new-conversation",
+        "/api/harness/new-conversation",
+    ):
       prompt = (data.get("prompt") or data.get("message") or "").strip()
-      conv_id = (data.get("convId") or data.get("conversationId") or "").strip()
       if not prompt:
         self._send_json({"ok": False, "error": "Missing prompt"}, status=400)
         return
+      force_new = path in (
+          "/_sidecar/new-conversation",
+          "/api/harness/new-conversation",
+      )
+      conv_id = "" if force_new else (data.get("convId") or data.get("conversationId") or "").strip()
+      if path in ("/_sidecar/send-message", "/api/harness/send-message") and not conv_id:
+        conv_id = _resolve_request_conv_id(body=data)
       try:
         if conv_id:
           res = _send_message_direct(
@@ -2202,28 +2635,32 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": False, "error": str(e)}, status=500)
       return
 
-    # v2 POST /api/chat/stop
-    if path == "/api/chat/stop":
-      conv_id = (
-          data.get("convId")
-          or data.get("conversationId")
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-          or ""
-      )
+    # Unified stop conversation (/api/chat/stop, /api/harness/cancel)
+    if path in ("/api/chat/stop", "/api/harness/cancel"):
+      conv_id = _resolve_request_conv_id(body=data)
       if not conv_id:
         self._send_json({"ok": False, "error": "Missing convId"}, status=400)
         return
-      resp = _call_ls("CancelCascadeInvocation", {"cascadeId": conv_id}, timeout=3.0)
+      resp = _call_ls(
+          "CancelCascadeInvocation", {"cascadeId": conv_id}, timeout=3.0
+      )
       self._send_json({"ok": True, "response": resp})
       return
 
-    # v2 POST /api/automation/toggle (Pause / Resume an automation via restart_policy)
+    # Pause / Resume an automation via restart_policy
     if path == "/api/automation/toggle":
       sidecar_id = (data.get("plugin") or data.get("sidecarId") or "").strip()
-      sjson_path = os.path.join(CONFIG_DIR, "sidecars", sidecar_id, "sidecar.json")
+      if not sidecar_id or "/" in sidecar_id or ".." in sidecar_id:
+        self._send_json({"ok": False, "error": "Invalid sidecarId"}, status=400)
+        return
+      sjson_path = os.path.join(
+          CONFIG_DIR, "sidecars", sidecar_id, "sidecar.json"
+      )
       if not os.path.isfile(sjson_path):
-        self._send_json({"ok": False, "error": f"Automation {sidecar_id} not found"}, status=404)
+        self._send_json(
+            {"ok": False, "error": f"Automation {sidecar_id} not found"},
+            status=404,
+        )
         return
       try:
         with open(sjson_path, "r", encoding="utf-8") as f:
@@ -2235,58 +2672,41 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
           json.dump(cfg, f, indent=2)
           f.write("\n")
         _AUTOMATIONS_CACHE["ts"] = 0.0
-        self._send_json({"ok": True, "plugin": sidecar_id, "restartPolicy": new_policy})
+        self._send_json(
+            {"ok": True, "plugin": sidecar_id, "restartPolicy": new_policy}
+        )
       except Exception as e:
         self._send_json({"ok": False, "error": str(e)}, status=500)
       return
 
-    # v2 POST /api/automation/trigger
+    # Trigger an automation on-demand
     if path == "/api/automation/trigger":
       sidecar_id = (data.get("plugin") or data.get("sidecarId") or "").strip()
-      sjson_path = os.path.join(CONFIG_DIR, "sidecars", sidecar_id, "sidecar.json")
-      if not os.path.isfile(sjson_path):
-        self._send_json({"ok": False, "error": f"Automation {sidecar_id} not found"}, status=404)
-        return
-      try:
-        with open(sjson_path, "r", encoding="utf-8") as f:
-          cfg = json.load(f)
-        args = cfg.get("args") or []
-        if len(args) >= 5 and args[1] == "agentapi" and args[2] == "send-message":
-          res = _send_message_direct(args[3], args[4])
-          self._send_json(res)
-          return
-        if len(args) >= 4 and args[1] == "agentapi" and args[2] == "new-conversation":
-          res = _start_conversation_direct(args[-1], title=sidecar_id)
-          self._send_json(res)
-          return
-        self._send_json({"ok": False, "error": "Unsupported automation command shape"}, status=400)
-      except Exception as e:
-        self._send_json({"ok": False, "error": str(e)}, status=500)
+      payload, status = _trigger_automation_by_id(sidecar_id)
+      self._send_json(payload, status=status)
       return
 
     if path == "/api/action":
       action = (data.get("action") or "").strip()
-      conv_id = (
-          data.get("convId")
-          or data.get("conversationId")
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-          or ""
-      )
+      conv_id = _resolve_request_conv_id(body=data)
       prompt = (data.get("prompt") or data.get("message") or "").strip()
 
       if action == "send_message":
         if not prompt or not conv_id:
-          self._send_json({"ok": False, "error": "Missing prompt or conversationId"}, status=400)
+          self._send_json(
+              {"ok": False, "error": "Missing prompt or conversationId"},
+              status=400,
+          )
           return
         try:
-          res = _send_message_direct(
-              conv_id,
-              prompt,
-              title=data.get("title") or "",
-              project_id=data.get("projectId"),
+          self._send_json(
+              _send_message_direct(
+                  conv_id,
+                  prompt,
+                  title=data.get("title") or "",
+                  project_id=data.get("projectId"),
+              )
           )
-          self._send_json(res)
         except Exception as e:
           self._send_json({"ok": False, "error": str(e)}, status=500)
         return
@@ -2296,49 +2716,39 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
           self._send_json({"ok": False, "error": "Missing prompt"}, status=400)
           return
         try:
-          res = _start_conversation_direct(
-              prompt,
-              title=data.get("title") or "",
-              model_tier=data.get("model") or "pro",
-              project_id=data.get("projectId"),
+          self._send_json(
+              _start_conversation_direct(
+                  prompt,
+                  title=data.get("title") or "",
+                  model_tier=data.get("model") or "pro",
+                  project_id=data.get("projectId"),
+              )
           )
-          self._send_json(res)
         except Exception as e:
           self._send_json({"ok": False, "error": str(e)}, status=500)
         return
 
       if action == "stop_conversation":
         if not conv_id:
-          self._send_json({"ok": False, "error": "Missing conversationId"}, status=400)
+          self._send_json(
+              {"ok": False, "error": "Missing conversationId"}, status=400
+          )
           return
-        resp = _call_ls("CancelCascadeInvocation", {"cascadeId": conv_id}, timeout=3.0)
+        resp = _call_ls(
+            "CancelCascadeInvocation", {"cascadeId": conv_id}, timeout=3.0
+        )
         self._send_json({"ok": True, "response": resp})
         return
 
       if action == "trigger_automation":
         sidecar_id = (data.get("sidecarId") or data.get("plugin") or "").strip()
-        sjson_path = os.path.join(CONFIG_DIR, "sidecars", sidecar_id, "sidecar.json")
-        if not os.path.isfile(sjson_path):
-          self._send_json({"ok": False, "error": f"Automation {sidecar_id} not found"}, status=404)
-          return
-        try:
-          with open(sjson_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-          args = cfg.get("args") or []
-          if len(args) >= 5 and args[1] == "agentapi" and args[2] == "send-message":
-            res = _send_message_direct(args[3], args[4])
-            self._send_json(res)
-            return
-          if len(args) >= 4 and args[1] == "agentapi" and args[2] == "new-conversation":
-            res = _start_conversation_direct(args[-1], title=sidecar_id)
-            self._send_json(res)
-            return
-          self._send_json({"ok": False, "error": "Unsupported automation command shape"}, status=400)
-        except Exception as e:
-          self._send_json({"ok": False, "error": str(e)}, status=500)
+        payload, status = _trigger_automation_by_id(sidecar_id)
+        self._send_json(payload, status=status)
         return
 
-      self._send_json({"ok": False, "error": f"Unknown action: {action}"}, status=400)
+      self._send_json(
+          {"ok": False, "error": f"Unknown action: {action}"}, status=400
+      )
       return
 
     if path == "/api/update":
@@ -2355,107 +2765,34 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": False, "error": str(e)}, status=500)
       return
 
-    if path in ("/_sidecar/send-message", "/api/harness/send-message"):
-      msg = (data.get("message") or data.get("prompt") or "").strip()
-      conv_id = (
-          data.get("convId")
-          or data.get("conversationId")
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-      )
-      if not msg or not conv_id:
-        self._send_json({"error": "Missing message or conversationId"}, status=400)
-        return
-      try:
-        res = _send_message_direct(
-            conv_id,
-            msg,
-            title=data.get("title") or "",
-            project_id=data.get("projectId"),
-        )
-        self._send_json(res)
-      except Exception as e:
-        self._send_json({"ok": False, "error": str(e)}, status=500)
-      return
-
-    if path in ("/_sidecar/new-conversation", "/api/harness/new-conversation"):
-      msg = (data.get("message") or data.get("prompt") or "").strip()
-      if not msg:
-        self._send_json({"error": "Missing message"}, status=400)
-        return
-      try:
-        res = _start_conversation_direct(
-            msg,
-            title=data.get("title") or "",
-            model_tier=data.get("model") or "pro",
-            project_id=data.get("projectId"),
-        )
-        self._send_json(res)
-      except Exception as e:
-        self._send_json({"ok": False, "error": str(e)}, status=500)
-      return
-
-    if path == "/api/harness/cancel":
-      conv_id = (
-          data.get("convId")
-          or data.get("conversationId")
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-      )
-      if not conv_id:
-        self._send_json({"error": "Missing conversationId"}, status=400)
-        return
-      resp = _call_ls("CancelCascadeInvocation", {"cascadeId": conv_id}, timeout=3.0)
-      self._send_json({"ok": True, "response": resp})
-      return
-
     if path == "/_sidecar/get-conversation-metadata":
-      conv_id = (
-          data.get("convId")
-          or data.get("conversationId")
-          or os.environ.get("ANTIGRAVITY_SIDECAR_CONVERSATION_ID")
-          or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-      )
+      conv_id = _resolve_request_conv_id(body=data)
       if not conv_id:
         self._send_json({"error": "Missing conversationId"}, status=400)
         return
-      resp = _call_ls("GetConversationMetadata", {"conversationId": conv_id}, timeout=2.5)
-      if resp is not None:
-        self._send_json({"response": {"conversationMetadata": {"metadata": resp.get("metadata") or {}}}})
-        return
-      self._send_json({"response": {"conversationMetadata": {"metadata": {}}}})
+      resp = _call_ls(
+          "GetConversationMetadata", {"conversationId": conv_id}, timeout=2.5
+      )
+      metadata = (resp or {}).get("metadata") if isinstance(resp, dict) else {}
+      self._send_json(
+          {"response": {"conversationMetadata": {"metadata": metadata or {}}}}
+      )
       return
 
     self._send_json({"error": "Not found"}, status=404)
 
 
-def _start_self_reload_watcher():
-  """Watches server.py mtime and exits so SidecarManager (restart_policy: always) respawns with fresh code."""
-  import threading
-  self_path = os.path.abspath(__file__)
-  try:
-    initial_mtime = os.path.getmtime(self_path)
-  except OSError:
-    return
-
-  def _watch():
-    while True:
-      time.sleep(1.5)
-      try:
-        if os.path.getmtime(self_path) != initial_mtime:
-          os._exit(0)
-      except OSError:
-        pass
-
-  t = threading.Thread(target=_watch, daemon=True)
-  t.start()
-
-
 def main():
-  _start_self_reload_watcher()
-  port = int(os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT", "8765"))
+  port = int(
+      os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT")
+      or os.environ.get("PORT")
+      or "8765"
+  )
   server = ThreadingHTTPServer(("0.0.0.0", port), HarnessRequestHandler)
-  print(f"[jetski-harness] Custom Harness listening on http://0.0.0.0:{port}", flush=True)
+  print(
+      f"[jetski-harness] Custom Harness v2.9 listening on http://0.0.0.0:{port}",
+      flush=True,
+  )
   try:
     server.serve_forever()
   except KeyboardInterrupt:
@@ -2466,4 +2803,3 @@ def main():
 
 if __name__ == "__main__":
   main()
-

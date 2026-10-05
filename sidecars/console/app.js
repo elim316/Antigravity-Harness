@@ -78,10 +78,10 @@
     const labelEl = document.getElementById("theme-label");
     if (iconEl && labelEl) {
       if (state.theme === "dark") {
-        iconEl.textContent = "☀️";
+        iconEl.textContent = "☀";
         labelEl.textContent = "Light";
       } else {
-        iconEl.textContent = "🌙";
+        iconEl.textContent = "☾";
         labelEl.textContent = "Dark";
       }
     }
@@ -439,7 +439,9 @@
     return String(str || "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   function renderMarkdownLite(text) {
@@ -492,11 +494,19 @@
     const cachePct = active.cacheHitPct || 0;
     const costUsd = active.estCostUsd || 0;
     const turns = active.turnCount || 0;
-    const modelName = active.model || "Gemini 2.5 Pro";
+    const modelName = active.model || "Gemini Next";
     const ctxWin = active.contextWindowTokens || 0;
     const ctxSatPct = Math.min(100, Math.round((ctxWin / 200_000) * 100));
 
-    const savedUsd = (cachedTok / 1_000_000) * (1.25 - 0.3125);
+    const rates = active.pricingRates || {
+      inputPer1M: 1.25,
+      cachedPer1M: 0.3125,
+      outputPer1M: 10.0,
+    };
+    const inRate = Number(rates.inputPer1M) || 1.25;
+    const cacheRate = Number(rates.cachedPer1M) || 0.3125;
+    const outRate = Number(rates.outputPer1M) || 10.0;
+    const savedUsd = (cachedTok / 1_000_000) * Math.max(0, inRate - cacheRate);
 
     const specs = {
       session_tokens: {
@@ -507,14 +517,14 @@
       },
       cache_hit_rate: {
         title: "Cache Hit Rate — Context Caching Efficiency",
-        desc: "Percentage of prompt tokens served from Gemini's prefix context cache instead of being re-tokenized from scratch. High cache hit rates (>75%) drastically reduce Time-To-First-Token (TTFT) latency and cut input token cost by ~75%.",
+        desc: "Percentage of prompt tokens served from prefix context cache instead of being re-tokenised from scratch. High cache hit rates (>75%) drastically reduce Time-To-First-Token (TTFT) latency and cut input token cost.",
         formula: "Cache Hit Rate = Cache Read Tokens ÷ (Fresh Input Tokens + Cache Read Tokens)",
         live: `Live breakdown: ${fmtTokens(cachedTok)} of ${fmtTokens(promptTok)} prompt tokens (${cachePct}%) were reused from cache, saving ~$${savedUsd.toFixed(2)} in compute cost this session.`,
       },
       session_cost: {
         title: "Estimated Session Cost — API Equivalent Spend",
-        desc: "Estimated dollar equivalent for the active conversation using standard Gemini Pro tier rates ($1.25/1M fresh input, $0.3125/1M cached context read, $10.00/1M output & thinking tokens).",
-        formula: "Cost = (Fresh × $1.25/1M) + (Cached × $0.3125/1M) + ((Output + Thinking) × $10/1M)",
+        desc: `Estimated dollar equivalent for the active conversation using ${modelName} tier rates ($${inRate}/1M fresh input, $${cacheRate}/1M cached context read, $${outRate}/1M output & thinking tokens).`,
+        formula: `Cost = (Fresh × $${inRate}/1M) + (Cached × $${cacheRate}/1M) + ((Output + Thinking) × $${outRate}/1M)`,
         live: `Live breakdown (${modelName}): $${costUsd.toFixed(2)} across ${turns} LLM calls (without context caching, this session would have cost ~$${(costUsd + savedUsd).toFixed(2)}).`,
       },
       global_tokens: {
@@ -525,12 +535,12 @@
       },
       context_saturation: {
         title: "Context Window Saturation — Compaction Threshold (~200k)",
-        desc: "Measures the latest turn's active prompt context size against Jetski's ~200,000-token context compaction threshold. When a conversation approaches 100%, Jetski summarizes earlier turns into a <CONTEXT_SUMMARY> block to keep latency low and prevent context overflow.",
+        desc: "Measures the latest turn's active prompt context size against Jetski's ~200,000-token context compaction threshold. When a conversation approaches 100%, Jetski summarises earlier turns into a <CONTEXT_SUMMARY> block to keep latency low and prevent context overflow.",
         formula: "Saturation % = Latest Turn Input Tokens ÷ 200,000 Compaction Threshold",
         live: `Current context window: ${fmtTokens(ctxWin)} / 200.0k tokens (${ctxSatPct}% full). ${ctxSatPct >= 85 ? "Approaching compaction threshold." : "Plenty of headroom before context compaction."}`,
       },
       turn_bars: {
-        title: "Per-Turn Context Growth Bars — Color Legend",
+        title: "Per-Turn Context Growth Bars — Colour Legend",
         desc: "Each horizontal bar represents one LLM call in the conversation, showing how the context window grows as files are viewed and tools run.",
         formula: "Green = Cached Context Reused · Blue = Fresh Uncached Input · Purple = Model Output",
         live: `Latest turn context window: ${fmtTokens(ctxWin)} tokens (${turns} total turns in this session).`,
@@ -581,13 +591,6 @@
       if (!box) return;
       box.innerHTML = html;
       box.hidden = false;
-      box.querySelectorAll(".js-close-explainer").forEach((btn) => {
-        btn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          state.selectedMetric = "";
-          renderMetricExplainers(state.data);
-        });
-      });
     });
   }
 
@@ -699,13 +702,6 @@
       if (!box) return;
       box.innerHTML = html;
       box.hidden = false;
-      box.querySelectorAll(".js-close-auto-explainer").forEach((btn) => {
-        btn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          state.selectedAutomation = "";
-          renderAutomationExplainers();
-        });
-      });
     });
   }
 
@@ -873,14 +869,6 @@
       if (!strip) return;
       strip.innerHTML = chipsHtml;
       strip.hidden = false;
-      strip.querySelectorAll(".js-focus-step").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          focusStepInTracer(
-            btn.getAttribute("data-step-index"),
-            btn.getAttribute("data-tool-name")
-          );
-        });
-      });
     });
   }
 
@@ -1076,23 +1064,9 @@
       });
     }
 
-    wireToolStepClickHandlers(container);
     if (shouldScrollBottom) {
       container.scrollTop = container.scrollHeight;
     }
-  }
-
-  function wireToolStepClickHandlers(container) {
-    if (!container) return;
-    container.querySelectorAll(".js-focus-step").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-        const stepIdx = btn.getAttribute("data-step-index");
-        const toolName = btn.getAttribute("data-tool-name");
-        focusStepInTracer(stepIdx, toolName);
-      });
-    });
   }
 
   function renderChatAndOverview(data, forceScrollBottom = false) {
@@ -1291,14 +1265,6 @@
       bentoAutoList.innerHTML =
         combinedRows.slice(0, 6).join("") ||
         `<div class="empty-state-sm">No automations or sidecars found.</div>`;
-
-      bentoAutoList.querySelectorAll(".bento-auto-row[data-auto-id]").forEach((row) => {
-        row.addEventListener("click", () => {
-          const id = row.getAttribute("data-auto-id") || "";
-          state.selectedAutomation = state.selectedAutomation === id ? "" : id;
-          renderAutomationExplainers();
-        });
-      });
     }
 
     const bentoMcpStrip = document.getElementById("bento-mcp-strip");
@@ -1369,55 +1335,6 @@
             `;
           })
           .join("");
-
-        autoGrid.querySelectorAll(".js-explain-auto").forEach((btn) => {
-          btn.addEventListener("click", (e) => {
-            e.stopPropagation();
-            const id = btn.getAttribute("data-auto-id") || "";
-            state.selectedAutomation = state.selectedAutomation === id ? "" : id;
-            renderAutomationExplainers();
-          });
-        });
-
-        autoGrid.querySelectorAll(".js-toggle-auto").forEach((btn) => {
-          btn.addEventListener("click", async (e) => {
-            e.stopPropagation();
-            const plugin = btn.getAttribute("data-plugin");
-            btn.disabled = true;
-            try {
-              await apiFetch("api/automation/toggle", {
-                method: "POST",
-                body: JSON.stringify({ plugin }),
-              });
-            } catch (_) {}
-            btn.disabled = false;
-            fetchState(false);
-          });
-        });
-
-        autoGrid.querySelectorAll(".js-trigger-auto").forEach((btn) => {
-          btn.addEventListener("click", async (e) => {
-            e.stopPropagation();
-            const plugin = btn.getAttribute("data-plugin");
-            btn.disabled = true;
-            btn.textContent = "Triggering...";
-            try {
-              const res = await apiFetch("api/automation/trigger", {
-                method: "POST",
-                body: JSON.stringify({ plugin }),
-              });
-              const r = await res.json();
-              btn.textContent = r.ok ? "Triggered" : "Failed";
-            } catch (_) {
-              btn.textContent = "Error";
-            }
-            setTimeout(() => {
-              btn.disabled = false;
-              btn.textContent = "Run Now";
-              fetchState(false);
-            }, 2000);
-          });
-        });
       }
     }
 
@@ -1458,15 +1375,6 @@
             `;
           })
           .join("");
-
-        sideGrid.querySelectorAll(".js-explain-auto").forEach((btn) => {
-          btn.addEventListener("click", (e) => {
-            e.stopPropagation();
-            const id = btn.getAttribute("data-auto-id") || "";
-            state.selectedAutomation = state.selectedAutomation === id ? "" : id;
-            renderAutomationExplainers();
-          });
-        });
       }
     }
 
@@ -1499,7 +1407,7 @@
     // --- Overview Quadrant 3 (Tokens & Cache) ---
     const bentoModel = document.getElementById("bento-model-label");
     if (bentoModel) {
-      bentoModel.textContent = `Model: ${active.model || "Gemini 2.5 Pro"}`;
+      bentoModel.textContent = `Model: ${active.model || "Gemini Next"}`;
     }
     const bentoSession = document.getElementById("bento-tok-session");
     if (bentoSession) {
@@ -1588,7 +1496,7 @@
       )} cached tokens reused`;
     }
     if (elCost) elCost.textContent = `$${(active.estCostUsd || 0).toFixed(2)}`;
-    if (elModel) elModel.textContent = `Model: ${active.model || "Gemini 2.5 Pro"}`;
+    if (elModel) elModel.textContent = `Model: ${active.model || "Gemini Next"}`;
     if (elGlobal) elGlobal.textContent = fmtTokens(global.totalTokens || 0);
     if (elGlobalSub) {
       elGlobalSub.textContent = `Across ${
@@ -1758,7 +1666,95 @@
     window.open(window.location.href, "_blank", "noopener,noreferrer");
   }
 
+  function initDelegatedDynamicListeners() {
+    document.addEventListener("click", async (e) => {
+      const target = e.target;
+      if (!target || typeof target.closest !== "function") return;
+
+      // 1. Focus tool or subagent step in embedded Agent Tracer
+      const focusBtn = target.closest(".js-focus-step");
+      if (focusBtn) {
+        e.stopPropagation();
+        e.preventDefault();
+        focusStepInTracer(
+          focusBtn.getAttribute("data-step-index"),
+          focusBtn.getAttribute("data-tool-name")
+        );
+        return;
+      }
+
+      // 2. Close metric explainer drawer
+      if (target.closest(".js-close-explainer")) {
+        e.stopPropagation();
+        state.selectedMetric = "";
+        if (state.data) renderMetricExplainers(state.data);
+        return;
+      }
+
+      // 3. Close automation explainer drawer
+      if (target.closest(".js-close-auto-explainer")) {
+        e.stopPropagation();
+        state.selectedAutomation = "";
+        renderAutomationExplainers();
+        return;
+      }
+
+      // 4. Pause / Resume automation button
+      const toggleBtn = target.closest(".js-toggle-auto");
+      if (toggleBtn) {
+        e.stopPropagation();
+        const plugin = toggleBtn.getAttribute("data-plugin");
+        toggleBtn.disabled = true;
+        try {
+          await apiFetch("api/automation/toggle", {
+            method: "POST",
+            body: JSON.stringify({ plugin }),
+          });
+        } catch (_) {}
+        toggleBtn.disabled = false;
+        fetchState(false);
+        return;
+      }
+
+      // 5. Trigger automation now button
+      const triggerBtn = target.closest(".js-trigger-auto");
+      if (triggerBtn) {
+        e.stopPropagation();
+        const plugin = triggerBtn.getAttribute("data-plugin");
+        triggerBtn.disabled = true;
+        triggerBtn.textContent = "Triggering...";
+        try {
+          const res = await apiFetch("api/automation/trigger", {
+            method: "POST",
+            body: JSON.stringify({ plugin }),
+          });
+          const r = await res.json();
+          triggerBtn.textContent = r.ok ? "Triggered" : "Failed";
+        } catch (_) {
+          triggerBtn.textContent = "Error";
+        }
+        setTimeout(() => {
+          triggerBtn.disabled = false;
+          triggerBtn.textContent = "Run Now";
+          fetchState(false);
+        }, 2000);
+        return;
+      }
+
+      // 6. Explain automation button or Overview automation row click
+      const explainEl = target.closest(".js-explain-auto, .bento-auto-row[data-auto-id]");
+      if (explainEl) {
+        e.stopPropagation();
+        const id = explainEl.getAttribute("data-auto-id") || "";
+        state.selectedAutomation = state.selectedAutomation === id ? "" : id;
+        renderAutomationExplainers();
+      }
+    });
+  }
+
   function initControls() {
+    initDelegatedDynamicListeners();
+
     // Theme toggle
     const themeBtn = document.getElementById("btn-theme-toggle");
     if (themeBtn) {
