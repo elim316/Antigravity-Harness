@@ -407,19 +407,27 @@ def _get_model_display_name(raw_model: str) -> str:
   return raw_model.replace("MODEL_GOOGLE_", "").replace("MODEL_", "").replace("_", " ").title()
 
 
-def _get_token_telemetry(conv_id: str, include_generations: bool = True) -> dict:
+def _get_token_telemetry(
+    conv_id: str, include_generations: bool = True, allow_rpc: bool = True
+) -> dict:
   """Fetches exact token telemetry for conv_id via GetCascadeTrajectory."""
   tmeta = _summarize_transcript_fast(conv_id)
   mtime = tmeta.get("mtime", 0.0)
   now = time.time()
 
   cached = _TOKEN_USAGE_CACHE.get(conv_id)
-  # Reuse cached result if transcript hasn't changed and cache is <6s old (or <120s for older convs)
-  ttl = 5.0 if (now - mtime < 30.0) else 120.0
+  # Reuse cached result if transcript hasn't changed and cache is <12s old (or <300s for older convs)
+  ttl = 12.0 if (now - mtime < 30.0) else 300.0
   if cached and cached[0] == mtime and (now - cached[1] < ttl):
     return cached[2]
+  if not allow_rpc and cached:
+    return cached[2]
 
-  traj_resp = _call_ls("GetCascadeTrajectory", {"cascade_id": conv_id}, timeout=2.0)
+  traj_resp = (
+      _call_ls("GetCascadeTrajectory", {"cascade_id": conv_id}, timeout=2.0)
+      if allow_rpc
+      else None
+  )
   gen_meta = []
   ls_status = ""
   if traj_resp and isinstance(traj_resp.get("trajectory"), dict):
@@ -558,21 +566,37 @@ def _get_token_telemetry(conv_id: str, include_generations: bool = True) -> dict
   return result
 
 
+_LS_TRAJECTORIES_CACHE = {"ts": 0.0, "summaries": {}}
+_BRAIN_ENTRIES_CACHE = {"ts": 0.0, "ids": set()}
+_AUTOMATIONS_CACHE = {"ts": 0.0, "data": []}
+_RUNTIME_STATUS_CACHE = {"ts": 0.0, "data": {}}
+
+
 def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
   """Lists recent/active conversations and computes global token summary."""
-  ls_all = _call_ls("GetAllCascadeTrajectories", {}, timeout=1.8) or {}
-  summaries = ls_all.get("trajectorySummaries") or {}
+  now = time.time()
+  if _LS_TRAJECTORIES_CACHE["summaries"] and (now - _LS_TRAJECTORIES_CACHE["ts"] < 6.0):
+    summaries = _LS_TRAJECTORIES_CACHE["summaries"]
+  else:
+    ls_all = _call_ls("GetAllCascadeTrajectories", {}, timeout=1.8) or {}
+    summaries = ls_all.get("trajectorySummaries") or {}
+    _LS_TRAJECTORIES_CACHE.update({"ts": now, "summaries": summaries})
 
   conv_ids = set(summaries.keys())
-  if os.path.isdir(BRAIN_DIR):
+  if _BRAIN_ENTRIES_CACHE["ids"] and (now - _BRAIN_ENTRIES_CACHE["ts"] < 12.0):
+    conv_ids.update(_BRAIN_ENTRIES_CACHE["ids"])
+  elif os.path.isdir(BRAIN_DIR):
+    brain_ids = set()
     try:
       for entry in os.listdir(BRAIN_DIR):
         if re.match(r"^[a-fA-F0-9-]{20,}$", entry):
           tpath = _get_transcript_path(entry, full=False)
           if tpath and os.path.isfile(tpath):
-            conv_ids.add(entry)
+            brain_ids.add(entry)
     except OSError:
       pass
+    _BRAIN_ENTRIES_CACHE.update({"ts": now, "ids": brain_ids})
+    conv_ids.update(brain_ids)
 
   items = []
   for cid in conv_ids:
@@ -643,7 +667,8 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
 
   top_items = items[:18]
 
-  # Aggregate global token telemetry across top 6 most recent conversations
+  # Aggregate global token telemetry across top 6 most recent conversations.
+  # Only issue live GetCascadeTrajectory RPC for active_conv_id; use cache/fast estimation for the rest.
   global_in = 0
   global_out = 0
   global_think = 0
@@ -652,8 +677,11 @@ def _list_conversations(active_conv_id: str) -> tuple[list[dict], dict]:
   global_calls = 0
 
   for idx, item in enumerate(top_items):
-    if idx < 6 or item["id"] == active_conv_id:
-      tok = _get_token_telemetry(item["id"], include_generations=True)
+    is_active = item["id"] == active_conv_id
+    if idx < 6 or is_active:
+      tok = _get_token_telemetry(
+          item["id"], include_generations=is_active, allow_rpc=is_active
+      )
       item["tokens"] = tok
       item["totalTokens"] = tok.get("totalTokens", 0)
       item["estimatedCostUsd"] = tok.get("estimatedCostUsd", 0.0)
@@ -721,8 +749,12 @@ def _cron_utc_to_sgt_label(cron_expr: str) -> str:
   return f"{cron_expr} UTC (SGT = UTC+8)"
 
 
-def _list_automations_and_sidecars() -> list[dict]:
+def _list_automations_and_sidecars(force: bool = False) -> list[dict]:
   """Discovers all configured automations & sidecars and matches live OS processes."""
+  now = time.time()
+  if not force and _AUTOMATIONS_CACHE["data"] and (now - _AUTOMATIONS_CACHE["ts"] < 30.0):
+    return _AUTOMATIONS_CACHE["data"]
+
   # 1. Snapshot live processes
   procs = []
   try:
@@ -948,11 +980,16 @@ def _list_automations_and_sidecars() -> list[dict]:
   # Sort: running first, then cron-automations & daemons before ui-plugins
   kind_order = {"cron-automation": 0, "daemon": 1, "ui-plugin": 2}
   results.sort(key=lambda r: (0 if r["isRunning"] else 1, kind_order.get(r["kind"], 3), r["id"]))
+  _AUTOMATIONS_CACHE.update({"ts": now, "data": results})
   return results
 
 
-def _get_runtime_and_mcp_status() -> dict:
+def _get_runtime_and_mcp_status(force: bool = False) -> dict:
   """Collects MCP server health, OAuth status, Memory FUSE status, and LS state."""
+  now = time.time()
+  if not force and _RUNTIME_STATUS_CACHE["data"] and (now - _RUNTIME_STATUS_CACHE["ts"] < 30.0):
+    return _RUNTIME_STATUS_CACHE["data"]
+
   # 1. OAuth tokens from ~/.gemini/jetski/mcp_oauth_tokens.json
   oauth_path = os.path.join(JETSKI_DIR, "mcp_oauth_tokens.json")
   oauth_map = {}
@@ -1015,7 +1052,7 @@ def _get_runtime_and_mcp_status() -> dict:
   now_utc = datetime.now(timezone.utc)
   now_sgt = now_utc.astimezone(SGT_TZ)
 
-  return {
+  res = {
       "mcpServers": mcp_servers,
       "mcpTotalTools": sum(s["toolCount"] for s in mcp_servers),
       "oauthConfigured": bool(oauth_map),
@@ -1037,6 +1074,8 @@ def _get_runtime_and_mcp_status() -> dict:
           "sidecarPort": int(os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT", 0)),
       },
   }
+  _RUNTIME_STATUS_CACHE.update({"ts": now, "data": res})
+  return res
 
 
 # --- Embedded Agent Tracer Compatibility Helpers ---
@@ -2195,6 +2234,7 @@ class HarnessRequestHandler(BaseHTTPRequestHandler):
         with open(sjson_path, "w", encoding="utf-8") as f:
           json.dump(cfg, f, indent=2)
           f.write("\n")
+        _AUTOMATIONS_CACHE["ts"] = 0.0
         self._send_json({"ok": True, "plugin": sidecar_id, "restartPolicy": new_policy})
       except Exception as e:
         self._send_json({"ok": False, "error": str(e)}, status=500)

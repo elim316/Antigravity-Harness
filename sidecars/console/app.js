@@ -149,28 +149,31 @@
     }
   }
 
-  function initTracerIframes() {
-    ["tracer-iframe", "overview-tracer-iframe"].forEach((id) => {
-      const iframe = document.getElementById(id);
-      if (!iframe) return;
-      const isCompact = id === "overview-tracer-iframe";
-      const q = new URLSearchParams();
-      if (isCompact) q.set("compact", "1");
-      if (sidecarToken) q.set("token", sidecarToken);
-      if (state.activeConvId) q.set("conversationId", state.activeConvId);
-      const qs = q.toString();
-      iframe.src = qs ? `tracer?${qs}` : "tracer";
+  function mountTracerIframe(id) {
+    const iframe = document.getElementById(id);
+    if (!iframe || iframe.dataset.mounted === "1") return;
+    iframe.dataset.mounted = "1";
+    const isCompact = id === "overview-tracer-iframe";
+    const q = new URLSearchParams();
+    if (isCompact) q.set("compact", "1");
+    if (sidecarToken) q.set("token", sidecarToken);
+    if (state.activeConvId) q.set("conversationId", state.activeConvId);
+    const qs = q.toString();
+    iframe.src = qs ? `tracer?${qs}` : "tracer";
 
-      iframe.addEventListener("load", () => {
-        applyTheme(state.theme, true);
-        if (state.activeConvId) {
-          broadcastTracerConversation(state.activeConvId);
-        }
-        if (isCompact && state.overviewTracerMode === "topology") {
-          setOverviewTracerMode("topology");
-        }
-      });
+    iframe.addEventListener("load", () => {
+      applyTheme(state.theme, true);
+      if (state.activeConvId) {
+        broadcastTracerConversation(state.activeConvId);
+      }
+      if (isCompact && state.overviewTracerMode === "topology") {
+        setOverviewTracerMode("topology");
+      }
     });
+  }
+
+  function initTracerIframes() {
+    mountTracerIframe("overview-tracer-iframe");
   }
 
   window.addEventListener("message", (e) => {
@@ -397,6 +400,9 @@
   function switchTab(tabName) {
     if (!tabName) return;
     state.activeTab = tabName;
+    if (tabName === "tracer") {
+      mountTracerIframe("tracer-iframe");
+    }
     document.querySelectorAll(".tab-btn").forEach((b) => {
       b.classList.toggle("active", b.getAttribute("data-tab") === tabName);
     });
@@ -1673,6 +1679,7 @@
   // 9. State Polling & Prompt Dispatch
   // =========================================================================
   async function fetchState(forceScrollBottom = false) {
+    if (!forceScrollBottom && document.hidden) return;
     const seq = ++state.fetchSeq;
     try {
       const qs = state.activeConvId
@@ -1902,6 +1909,9 @@
     initTabs();
     initControls();
     fetchState(true);
-    setInterval(() => fetchState(false), 2500);
+    setInterval(() => fetchState(false), 4000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) fetchState(false);
+    });
   });
 })();
