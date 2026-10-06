@@ -341,6 +341,23 @@
     document.querySelectorAll(".tab-view").forEach((v) => {
       v.classList.toggle("active", v.id === "view-" + tabName);
     });
+    if (tabName === "chat") {
+      requestAnimationFrame(() => {
+        const cm = document.getElementById("chat-messages");
+        if (cm && (state.chatNeedsScrollBottom !== false || cm.scrollTop === 0)) {
+          cm.scrollTop = cm.scrollHeight;
+          state.chatNeedsScrollBottom = false;
+        }
+      });
+    } else if (tabName === "overview" || tabName === "tracer") {
+      requestAnimationFrame(() => {
+        const iframeId = tabName === "tracer" ? "tracer-iframe" : "overview-tracer-iframe";
+        const ifr = document.getElementById(iframeId);
+        if (ifr && ifr.contentWindow) {
+          try { ifr.contentWindow.dispatchEvent(new Event("resize")); } catch (_) {}
+        }
+      });
+    }
   }
 
   function initTabs() {
@@ -847,6 +864,7 @@
 
   function updateChatContainerPreservingDetails(container, html, shouldScrollBottom) {
     if (!container) return;
+    const prevScrollTop = container.scrollTop;
     const openIds = new Set();
     container.querySelectorAll("details[data-detail-id]").forEach((d) => {
       if (d.open) openIds.add(d.getAttribute("data-detail-id"));
@@ -857,7 +875,14 @@
         if (openIds.has(d.getAttribute("data-detail-id"))) d.open = true;
       });
     }
-    if (shouldScrollBottom) container.scrollTop = container.scrollHeight;
+    if (shouldScrollBottom) {
+      const targetTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      if (Math.abs(container.scrollTop - targetTop) > 2) {
+        container.scrollTop = container.scrollHeight;
+      }
+    } else {
+      container.scrollTop = prevScrollTop;
+    }
   }
 
   function renderChatAndOverview(data, forceScrollBottom = false) {
@@ -923,21 +948,26 @@
 
     const container = document.getElementById("chat-messages");
     if (container) {
-      const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+      const isHidden = container.clientHeight === 0;
+      const nearBottom = isHidden || (container.scrollHeight - container.scrollTop - container.clientHeight < 120);
+      if (isHidden && (forceScrollBottom || nearBottom)) {
+        state.chatNeedsScrollBottom = true;
+      }
       if (items.length === 0) {
         container.innerHTML = `<div class="empty-state">No messages found for this conversation yet. Send a prompt below to begin!</div>`;
       } else {
-        updateChatContainerPreservingDetails(container, items.map((it) => buildMessageHtml(it, false)).join(""), forceScrollBottom || nearBottom);
+        updateChatContainerPreservingDetails(container, items.map((it) => buildMessageHtml(it, false)).join(""), !isHidden && (forceScrollBottom || nearBottom));
       }
     }
 
     const bentoContainer = document.getElementById("bento-chat-messages");
     if (bentoContainer) {
-      const nearBottom = bentoContainer.scrollHeight - bentoContainer.scrollTop - bentoContainer.clientHeight < 120;
+      const isBentoHidden = bentoContainer.clientHeight === 0;
+      const nearBottom = isBentoHidden || (bentoContainer.scrollHeight - bentoContainer.scrollTop - bentoContainer.clientHeight < 120);
       if (items.length === 0) {
         bentoContainer.innerHTML = `<div class="empty-state-sm">No messages in this session yet. Type below to prompt Jetski!</div>`;
       } else {
-        updateChatContainerPreservingDetails(bentoContainer, items.slice(-10).map((it) => buildMessageHtml(it, true)).join(""), forceScrollBottom || nearBottom);
+        updateChatContainerPreservingDetails(bentoContainer, items.slice(-10).map((it) => buildMessageHtml(it, true)).join(""), !isBentoHidden && (forceScrollBottom || nearBottom));
       }
     }
   }

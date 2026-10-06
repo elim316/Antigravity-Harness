@@ -949,9 +949,14 @@ def _render_embedded_tracer_html(conv_id: str) -> bytes:
       const d = ev.data;
       if (!d) return;
       if (d.type === 'HARNESS_SET_CONVERSATION' && d.conversationId && window.sidecar.conversationId !== d.conversationId) {{
-        const nextUrl = new URL(window.location.href);
-        nextUrl.searchParams.set('conversationId', d.conversationId);
-        window.location.replace(nextUrl.toString());
+        window.sidecar.conversationId = d.conversationId;
+        if (typeof window.resetToHostConversation === 'function') {{
+          window.resetToHostConversation();
+        }} else {{
+          const nextUrl = new URL(window.location.href);
+          nextUrl.searchParams.set('conversationId', d.conversationId);
+          window.location.replace(nextUrl.toString());
+        }}
       }} else if (d.type === 'HARNESS_SET_THEME') {{
         const wantDark = d.theme ? (d.theme === 'dark') : !!d.dark;
         if (wantDark !== (document.documentElement.getAttribute('data-theme') === 'dark')) {{
@@ -960,11 +965,16 @@ def _render_embedded_tracer_html(conv_id: str) -> bytes:
           else document.documentElement.setAttribute('data-theme', wantDark ? 'dark' : 'light');
         }}
       }} else if (d.type === 'HARNESS_SET_VIEW_MODE' && d.mode) {{
-        const btn = document.getElementById(d.mode === 'topology' ? 'btnViewTopology' : 'btnViewTimeline');
-        if (btn) btn.click();
+        if (typeof window.setTracerViewMode === 'function') {{
+          window.setTracerViewMode(d.mode);
+        }} else {{
+          const btn = document.getElementById(d.mode === 'topology' ? 'btnViewTopology' : (d.mode === 'simple_topo' ? 'btnViewSimpleTopo' : 'btnViewTimeline'));
+          if (btn) btn.click();
+        }}
       }} else if (d.type === 'HARNESS_FOCUS_STEP' && d.stepIndex != null) {{
-        const timelineBtn = document.getElementById('btnViewTimeline');
-        if (timelineBtn && document.body.classList.contains('topology-mode')) timelineBtn.click();
+        if (typeof window.setTracerViewMode === 'function' && document.body.classList.contains('topology-mode')) {{
+          window.setTracerViewMode('timeline');
+        }}
         setTimeout(function() {{
           const searchInput = document.getElementById('searchBox');
           if (d.toolName && searchInput) {{
@@ -976,11 +986,10 @@ def _render_embedded_tracer_html(conv_id: str) -> bytes:
     }});
     window.addEventListener('DOMContentLoaded', function() {{
       if (isCompact && document.body) document.body.classList.add('inspector-collapsed');
-      if (initialMode === 'topology') {{
+      if (initialMode === 'topology' || initialMode === 'simple_topo') {{
         setTimeout(function() {{
-          const b = document.getElementById('btnViewTopology');
-          if (b) b.click();
-        }}, 120);
+          if (typeof window.setTracerViewMode === 'function') window.setTracerViewMode(initialMode);
+        }}, 80);
       }}
       const btn = document.getElementById('btnTheme');
       if (btn) {{
