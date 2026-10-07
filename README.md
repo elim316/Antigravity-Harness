@@ -1,11 +1,11 @@
-# Jetski Harness
+# Antigravity Harness
 
-[![Platform: Jetski UI Sidecar](https://img.shields.io/badge/Platform-Jetski_UI_Sidecar-4285F4?style=flat-square&logo=googlechrome&logoColor=white)](#)
+[![Platform: Antigravity UI Sidecar](https://img.shields.io/badge/Platform-Antigravity_UI_Sidecar-4285F4?style=flat-square&logo=googlechrome&logoColor=white)](#)
 [![Backend: Python 3 Connect-RPC](https://img.shields.io/badge/Backend-Python_3_%2B_Connect--RPC-3776AB?style=flat-square&logo=python&logoColor=white)](#directory-structure)
 [![UI: Customisable 2x2 Bento Grid](https://img.shields.io/badge/UI-Customisable_2x2_Bento_Grid-0F9D58?style=flat-square)](#key-features)
 [![Telemetry: Live Token and Cache KPIs](https://img.shields.io/badge/Telemetry-Token_%26_Cache_KPIs-8E24AA?style=flat-square)](#key-features)
 
-A unified custom UI plugin and mission control workspace for Jetski and Antigravity. It combines multi-session agent chat, an embedded execution graph and architecture visualiser ([`Agent Tracer`](https://github.com/elim316/Jetski-Agent-Tracer-Plugin)), cron and daemon automation controls, and real-time token, context-cache, and cost telemetry.
+A unified custom UI plugin and mission control workspace for Antigravity and Antigravity. It combines multi-session agent chat, an embedded execution graph and architecture visualiser ([`Agent Tracer`](https://github.com/elim316/Antigravity-Agent-Tracer-Plugin)), cron and daemon automation controls, and real-time token, context-cache, and cost telemetry.
 
 ---
 
@@ -36,7 +36,7 @@ A unified custom UI plugin and mission control workspace for Jetski and Antigrav
 ## Directory structure
 
 ```text
-jetski-harness/
+antigravity-harness/
 ├── plugin.json                # Plugin manifest
 └── sidecars/
     └── console/
@@ -50,10 +50,10 @@ jetski-harness/
 
 ## Installation
 
-Clone this repository into `~/.gemini/config/plugins/jetski-harness`:
+Clone this repository into `~/.gemini/config/plugins/antigravity-harness`:
 
 ```bash
-git clone https://github.com/elim316/Jetski-Harness.git ~/.gemini/config/plugins/jetski-harness
+git clone https://github.com/elim316/Antigravity-Harness.git ~/.gemini/config/plugins/antigravity-harness
 ```
 
-`SidecarManager` automatically discovers `sidecars/console/sidecar.json` and launches the Jetski Harness auxiliary pane.
+`SidecarManager` automatically discovers `sidecars/console/sidecar.json` and launches the Antigravity Harness auxiliary pane.
